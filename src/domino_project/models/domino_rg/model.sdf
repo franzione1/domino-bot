@@ -1,0 +1,60 @@
+<?xml version="1.0" ?>
+<sdf version="1.7">
+  <model name="domino_red_green">
+    <static>false</static> <link name="link">
+      
+      <inertial>
+        <mass>0.1</mass> <inertia>
+          <ixx>0.0000416</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.0001041</iyy>
+          <iyz>0</iyz>
+          <izz>0.0001041</izz>
+        </inertia>
+      </inertial>
+
+      <collision name="collision">
+        <geometry>
+          <box>
+            <size>0.1 0.05 0.02</size> </box>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>1.0</mu> <mu2>1.0</mu2>
+            </ode>
+          </friction>
+        </surface>
+      </collision>
+
+      <visual name="visual_left">
+        <pose>-0.025 0 0 0 0 0</pose> <geometry>
+          <box>
+            <size>0.05 0.05 0.02</size> </box>
+        </geometry>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Red</name>
+          </script>
+        </material>
+      </visual>
+
+      <visual name="visual_right">
+        <pose>0.025 0 0 0 0 0</pose> <geometry>
+          <box>
+            <size>0.05 0.05 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Green</name>
+          </script>
+        </material>
+      </visual>
+
+    </link>
+  </model>
+</sdf>
