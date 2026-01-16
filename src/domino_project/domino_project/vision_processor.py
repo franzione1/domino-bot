@@ -88,7 +88,7 @@ class DominoDetector(Node):
                 point_msg = Point()
                 point_msg.x = real_x
                 point_msg.y = real_y
-                point_msg.z = 1.02
+                point_msg.z = 1.32
                 
                 self.coord_pub.publish(point_msg)
                 

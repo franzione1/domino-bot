@@ -1,156 +1,218 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionClient
 from geometry_msgs.msg import Point
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from control_msgs.action import GripperCommand
 import math
+import time
+import threading
 
 class RobotMover(Node):
     def __init__(self):
         super().__init__('robot_mover')
         
+        # --- CONFIGURAZIONE ---
+        self.MOLTIPLICATORE_X = 1.0  
+        self.MOLTIPLICATORE_Y = -1.0 
+        
+        # Altezze calibrate
+        self.ALTEZZA_BASE = 1.305      
+        self.Z_TASELLO = 1.32          
+        self.ALTEZZA_PRESA = self.Z_TASELLO + 0.14 # Presa decisa
+        self.ALTEZZA_SICUREZZA = self.Z_TASELLO + 0.35 
+        
+        # Lunghezze braccio
+        self.L1 = 0.316
+        self.L2 = 0.384
+        
+        # Posizione HOME (Stabile)
+        self.HOME_POS = [0.0, -0.78, 0.0, -2.35, 0.0, 1.57, 0.78]
+
+        # Ultimo target visitato (per evitare loop)
+        self.last_target_x = 0.0
+        self.last_target_y = 0.0
+
+        # Sottoscrizione Visione
         self.subscription = self.create_subscription(
             Point, '/domino_position', self.listener_callback, 10)
             
-        self.publisher_ = self.create_publisher(
+        # Publisher Braccio
+        self.arm_publisher = self.create_publisher(
             JointTrajectory, '/panda_arm_controller/joint_trajectory', 10)
+        
+        # --- CLIENT PINZA MULTIPLI (Per gestire il tuo setup) ---
+        # Proviamo a connetterci a tutti i possibili controller della pinza
+        self.gripper_client_main = ActionClient(self, GripperCommand, '/panda_hand_controller/gripper_cmd')
+        self.gripper_client_left = ActionClient(self, GripperCommand, '/panda_handleft_controller/gripper_cmd')
+        self.gripper_client_right = ActionClient(self, GripperCommand, '/panda_handright_controller/gripper_cmd')
             
         self.joint_names = [
             'panda_joint1', 'panda_joint2', 'panda_joint3', 
             'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7'
         ]
         
-        self.target_locked = False
+        self.target_locked = True 
         
-        # --- PARAMETRI ---
-        self.ALTEZZA_PRESA = 0.05
-        self.ALTEZZA_SICUREZZA = 0.30
-        self.L1 = 0.316
-        self.L2 = 0.384
-        
-        # --- DEFINIZIONE POSIZIONE "HOME" (Alta e Arretrata) ---
-        # J2=0.0 (Dritto verticale), J4=-1.5 (Gomito a 90°), J6=1.57 (Polso dritto)
-        # Questa posa libera sicuramente la visuale della telecamera
-        self.HOME_POS = [0.0, 0.0, 0.0, -1.5, 0.0, 1.57, 0.78]
-
-        # --- AUTO-RESET ALL'AVVIO ---
-        # Creiamo un timer che scatta UNA volta sola dopo 1 secondo
-        # per spostare il robot via dalla telecamera appena accendi il nodo.
+        # Timer avvio
         self.timer_init = self.create_timer(1.0, self.mossa_di_risveglio)
-        
-        self.get_logger().info('Robot Mover: In attesa... (Tra 1s eseguo reset posizione)')
+        self.get_logger().info('Robot Mover: In attesa di avvio...')
 
     def mossa_di_risveglio(self):
-        """Questa funzione viene chiamata SOLO all'avvio per liberare la visuale."""
-        self.get_logger().info('>>> ESEGUO RESET POSIZIONE (Sposto il robot in HOME) <<<')
-        
-        traj_msg = JointTrajectory()
-        traj_msg.joint_names = self.joint_names
-        
-        # Creiamo un punto per andare a casa in 4 secondi
-        p_home = JointTrajectoryPoint()
-        p_home.positions = self.HOME_POS
-        p_home.time_from_start.sec = 4
-        traj_msg.points.append(p_home)
-        
-        self.publisher_.publish(traj_msg)
-        
-        # Spegniamo il timer (non deve farlo più)
+        self.get_logger().info('>>> RESET HOME E PINZA <<<')
+        self.muovi_braccio(self.HOME_POS, durata=4.0)
+        self.muovi_pinza(0.04) # Apre
         self.timer_init.cancel()
+        threading.Timer(5.0, self.sblocca_target).start()
 
-    def calcola_ik(self, x, y, z_desiderata):
-        theta1 = math.atan2(y, x)
-        r = math.sqrt(x**2 + y**2) - 0.05 
-        z_rel = z_desiderata - 0.33
-        d = math.sqrt(r**2 + z_rel**2)
-        
-        if d > (self.L1 + self.L2):
-            d = self.L1 + self.L2 - 0.01 
-            
-        cos_theta4 = (self.L1**2 + self.L2**2 - d**2) / (2 * self.L1 * self.L2)
-        theta4 = -1.0 * (math.pi - math.acos(max(-1.0, min(1.0, cos_theta4)))) 
-        
-        alpha = math.atan2(z_rel, r)
-        beta = math.acos((self.L1**2 + d**2 - self.L2**2) / (2 * self.L1 * d))
-        theta2 = alpha + beta 
-        
-        # Calcolo Polso perpendicolare (Offset regolabile se punta avanti/indietro)
-        theta6 = 3.14 - (theta2 + theta4) + 0.5 
-        
-        return theta1, theta2, theta4, theta6
+    def sblocca_target(self):
+        self.target_locked = False
+        self.get_logger().info('>>> SISTEMA PRONTO: IN ATTESA DI TASSELLI ROSSI <<<')
 
     def listener_callback(self, msg):
         if self.target_locked:
             return
-
-        tx = msg.x
-        ty = msg.y
-        drop_x = tx
-        drop_y = ty - 0.15 
         
+        # --- FILTRO ANTI-LOOP ---
+        # Se il nuovo target è vicinissimo all'ultimo eseguito, ignoralo
+        distanza = math.sqrt((msg.x - self.last_target_x)**2 + (msg.y - self.last_target_y)**2)
+        if distanza < 0.05: # 5 cm di tolleranza
+            return
+
         self.target_locked = True
-        self.get_logger().info(f'Target trovato! Eseguo sequenza completa con ritorno HOME.')
+        self.get_logger().info(f'NUOVO TARGET VALIDO: X={msg.x:.2f} Y={msg.y:.2f}')
         
-        traj_msg = JointTrajectory()
-        traj_msg.joint_names = self.joint_names
-        
-        # --- SEQUENZA CON RITORNO A HOME ---
-        
-        # PUNTO 0: TORNA A HOME (Sicurezza prima di scendere)
-        # Anche se è già lì, glielo ridiciamo per sicurezza
-        p0 = JointTrajectoryPoint()
-        p0.positions = self.HOME_POS
-        p0.time_from_start.sec = 3 # Si prende 3 secondi per resettarsi
-        traj_msg.points.append(p0)
-        
-        # PUNTO 1: AVVICINAMENTO (Sopra il tassello)
-        j1, j2, j4, j6 = self.calcola_ik(tx, ty, self.ALTEZZA_SICUREZZA)
-        p1 = JointTrajectoryPoint()
-        p1.positions = [j1, j2, 0.0, j4, 0.0, j6, 0.79]
-        p1.time_from_start.sec = 6 # Tempo aumentato perché parte da Home
-        traj_msg.points.append(p1)
-        
-        # PUNTO 2: PRESA (Giù)
-        j1, j2, j4, j6 = self.calcola_ik(tx, ty, self.ALTEZZA_PRESA)
-        p2 = JointTrajectoryPoint()
-        p2.positions = [j1, j2, 0.0, j4, 0.0, j6, 0.79]
-        p2.time_from_start.sec = 9
-        traj_msg.points.append(p2)
-        
-        # PUNTO 3: SU (Sicurezza)
-        j1_up, j2_up, j4_up, j6_up = self.calcola_ik(tx, ty, self.ALTEZZA_SICUREZZA)
-        p3 = JointTrajectoryPoint()
-        p3.positions = [j1_up, j2_up, 0.0, j4_up, 0.0, j6_up, 0.79]
-        p3.time_from_start.sec = 11
-        traj_msg.points.append(p3)
-        
-        # PUNTO 4: SPOSTA (Ruota 90°)
-        j1_drop, j2_drop, j4_drop, j6_drop = self.calcola_ik(drop_x, drop_y, self.ALTEZZA_SICUREZZA)
-        p4 = JointTrajectoryPoint()
-        p4.positions = [j1_drop, j2_drop, 0.0, j4_drop, 0.0, j6_drop, 2.36] 
-        p4.time_from_start.sec = 14
-        traj_msg.points.append(p4)
+        # Aggiorna ultimo target
+        self.last_target_x = msg.x
+        self.last_target_y = msg.y
 
-        # PUNTO 5: GIÙ (Deposita)
-        j1_drop_low, j2_drop_low, j4_drop_low, j6_drop_low = self.calcola_ik(drop_x, drop_y, self.ALTEZZA_PRESA)
-        p5 = JointTrajectoryPoint()
-        p5.positions = [j1_drop_low, j2_drop_low, 0.0, j4_drop_low, 0.0, j6_drop_low, 2.36]
-        p5.time_from_start.sec = 17
-        traj_msg.points.append(p5)
+        mission = threading.Thread(target=self.esegui_missione, args=(msg.x, msg.y))
+        mission.start()
+
+    def esegui_missione(self, target_x, target_y):
+        tx = target_x * self.MOLTIPLICATORE_X
+        ty = target_y * self.MOLTIPLICATORE_Y
+        drop_x = 0.5 * self.MOLTIPLICATORE_X
+        drop_y = 0.0 
         
-        # PUNTO 6: FINALE (Torna a Home trionfante)
-        p6 = JointTrajectoryPoint()
-        p6.positions = self.HOME_POS
-        p6.time_from_start.sec = 20
-        traj_msg.points.append(p6)
+        self.get_logger().info(f'--> 1. AVVICINAMENTO a {tx:.2f}, {ty:.2f}')
+        q_appr = self.calcola_ik_stable(tx, ty, self.ALTEZZA_SICUREZZA)
+        if q_appr: self.muovi_braccio(q_appr, 4.0)
+        time.sleep(5.0)
         
-        self.publisher_.publish(traj_msg)
+        self.get_logger().info('--> 2. APERTURA PINZA')
+        self.muovi_pinza(0.04) # 4cm per lato (totale 8cm)
+        time.sleep(1.0)
+        
+        self.get_logger().info('--> 3. DISCESA')
+        q_down = self.calcola_ik_stable(tx, ty, self.ALTEZZA_PRESA)
+        if q_down: self.muovi_braccio(q_down, 3.0)
+        time.sleep(3.5)
+        
+        self.get_logger().info('--> 4. PRESA (CHIUSURA)')
+        self.muovi_pinza(0.0) 
+        time.sleep(1.5)
+        
+        self.get_logger().info('--> 5. RISALITA')
+        if q_appr: self.muovi_braccio(q_appr, 3.0)
+        time.sleep(3.5)
+        
+        self.get_logger().info(f'--> 6. SPOSTAMENTO')
+        q_drop = self.calcola_ik_stable(drop_x, drop_y, self.ALTEZZA_SICUREZZA)
+        if q_drop:
+            # Ruotiamo il polso di 90 gradi per allineamento
+            q_drop[6] += 1.57 
+            self.muovi_braccio(q_drop, 5.0)
+        time.sleep(5.5)
+        
+        self.get_logger().info('--> 7. DEPOSITO')
+        q_drop_low = self.calcola_ik_stable(drop_x, drop_y, self.ALTEZZA_PRESA)
+        if q_drop_low:
+            q_drop_low[6] += 1.57
+            self.muovi_braccio(q_drop_low, 3.0)
+        time.sleep(3.5)
+        
+        self.muovi_pinza(0.04) # Rilascia
+        time.sleep(1.0)
+        
+        self.get_logger().info('--> 8. FINE MISSIONE')
+        self.muovi_braccio(self.HOME_POS, 4.0)
+        time.sleep(4.0)
+        
+        self.get_logger().info('Missione conclusa. Attendo nuovi target (diversi dal precedente)...')
+        self.target_locked = False
+
+    def muovi_braccio(self, posizioni, durata):
+        msg = JointTrajectory()
+        msg.joint_names = self.joint_names
+        point = JointTrajectoryPoint()
+        point.positions = posizioni
+        point.time_from_start.sec = int(durata)
+        msg.points.append(point)
+        self.arm_publisher.publish(msg)
+
+    def muovi_pinza(self, apertura):
+        """Manda il comando a TUTTI i possibili controller della pinza"""
+        goal = GripperCommand.Goal()
+        goal.command.position = apertura
+        goal.command.max_effort = 100.0
+        
+        sent = False
+        # Tenta il controller Left (per il tuo yaml)
+        if self.gripper_client_left.wait_for_server(timeout_sec=0.2):
+            self.gripper_client_left.send_goal_async(goal)
+            sent = True
+        
+        # Tenta il controller Right (per il tuo yaml)
+        if self.gripper_client_right.wait_for_server(timeout_sec=0.2):
+            self.gripper_client_right.send_goal_async(goal)
+            sent = True
+            
+        # Tenta il controller Standard (caso fallback)
+        if not sent and self.gripper_client_main.wait_for_server(timeout_sec=0.2):
+            self.gripper_client_main.send_goal_async(goal)
+            sent = True
+            
+        if not sent:
+            self.get_logger().warn('ATTENZIONE: Nessun controller pinza trovato! (Ho provato main, left e right)')
+
+    def calcola_ik_stable(self, x, y, z_desiderata):
+        """IK Semplificato e Stabile per evitare rotazioni pazze"""
+        z_rel = z_desiderata - 0.33 - self.ALTEZZA_BASE
+        
+        theta1 = math.atan2(y, x)
+        r = math.sqrt(x**2 + y**2) - 0.05 
+        d = math.sqrt(r**2 + z_rel**2)
+        
+        if d > (self.L1 + self.L2):
+            d = self.L1 + self.L2 - 0.001
+
+        cos_theta4 = (self.L1**2 + self.L2**2 - d**2) / (2 * self.L1 * self.L2)
+        cos_theta4 = max(-1.0, min(1.0, cos_theta4))
+        theta4 = -1.0 * (math.pi - math.acos(cos_theta4)) # Gomito alto
+
+        alpha = math.atan2(z_rel, r)
+        beta = math.acos((self.L1**2 + d**2 - self.L2**2) / (2 * self.L1 * d))
+        theta2 = alpha + beta
+
+        # --- FIX STABILITÀ ---
+        # Invece di calcolare un theta6 "perfetto" che fa impazzire il robot,
+        # usiamo un valore fisso che punta verso il basso in modo naturale.
+        # 2.0 - 2.5 radianti è un buon compromesso per il Panda.
+        theta6 = 2.2 
+        
+        return [theta1, theta2, 0.0, theta4, 0.0, theta6, 0.79]
 
 def main(args=None):
     rclpy.init(args=args)
     node = RobotMover()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
-    main()
+    main()fi

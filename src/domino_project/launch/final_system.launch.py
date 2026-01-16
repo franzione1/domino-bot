@@ -24,19 +24,19 @@ def generate_launch_description():
     # 1. SPAWN TAVOLO (Lo avviciniamo a 0.7 invece di 0.9)
     spawn_table = Node(
         package='gazebo_ros', executable='spawn_entity.py',
-        arguments=['-entity', 'work_table', '-file', table_sdf, '-x', '0.7', '-y', '0.0', '-z', '0.5'],
+        arguments=['-entity', 'work_table', '-file', table_sdf, '-x', '0.7', '-y', '0.0', '-z', '0.8'],
         output='screen'
     )
     
     # 2. SPAWN CAMERA (Deve seguire il tavolo, quindi 0.7)
     spawn_camera = Node(
         package='gazebo_ros', executable='spawn_entity.py',
-        arguments=['-entity', 'camera_sensor', '-file', camera_sdf, '-x', '0.7', '-y', '0.0', '-z', '2.0', '-R', '0.0', '-P', '1.57', '-Y', '0.0'],
+        arguments=['-entity', 'camera_sensor', '-file', camera_sdf, '-x', '0.7', '-y', '0.0', '-z', '2.3', '-R', '0.0', '-P', '1.57', '-Y', '0.0'],
         output='screen'
     )
 
     # 3. SPAWN DOMINO (Erano a 0.7, li avviciniamo a 0.5 per tenerli al centro del tavolo)
-    z_height = '1.02'
+    z_height = '1.32'
     spawn_domino1 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_rg', '-file', domino_rg, '-x', '0.5', '-y', '0.0', '-z', z_height], output='screen')
     spawn_domino2 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_gb', '-file', domino_gb, '-x', '0.5', '-y', '0.2', '-z', z_height], output='screen')
     spawn_domino3 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_br', '-file', domino_br, '-x', '0.5', '-y', '-0.2', '-z', z_height], output='screen')
