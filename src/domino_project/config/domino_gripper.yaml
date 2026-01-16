@@ -2,9 +2,8 @@
   ros__parameters:
     panda_hand_controller:
       type: position_controllers/GripperActionController
-      joints:
-        - panda_finger_joint1
-        - panda_finger_joint2
+      # NOTA BENE: "joint" al singolare, non "joints"
+      joint: panda_finger_joint1
       goal_tolerance: 0.01
       stalled_velocity_threshold: 0.01
       stall_timeout: 1.0
