@@ -15,23 +15,13 @@ def generate_launch_description():
     domino_br = os.path.join(my_pkg, 'models', 'domino_br', 'model.sdf')
     table_sdf = os.path.join(my_pkg, 'models', 'work_table', 'model.sdf')
     camera_sdf = os.path.join(my_pkg, 'models', 'camera_sensor', 'model.sdf')
-    
-    # FILE CONFIGURAZIONE PINZA
-    gripper_config = os.path.join(my_pkg, 'config', 'domino_gripper.yaml')
 
     # Robot Panda Simulation
     panda_simulation = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(panda_pkg, 'launch', 'panda_simulation.launch.py'))
     )
 
-    # 1. Caricamento Parametri Pinza
-    # Usiamo un approccio leggermente diverso per evitare il crash del NoneType
-    load_gripper_params = ExecuteProcess(
-        cmd=['ros2', 'param', 'load', '/controller_manager', gripper_config],
-        output='screen'
-    )
-
-    # 2. Avvio Controller Pinza (CORREZIONE QUI: 'start' invece di 'active')
+    # Avvio Controller Pinza (CORREZIONE QUI: 'start' invece di 'active')
     spawn_gripper_controller = ExecuteProcess(
         cmd=['ros2', 'control', 'load_controller', 'panda_hand_controller', '--set-state', 'start'],
         output='screen'
@@ -57,6 +47,5 @@ def generate_launch_description():
         
         # SEQUENZA PINZA RITARDATA
         # Aumentiamo un po' il ritardo per dare tempo al controller manager di svegliarsi
-        TimerAction(period=20.0, actions=[load_gripper_params]),
         TimerAction(period=22.0, actions=[spawn_gripper_controller]),
     ])
