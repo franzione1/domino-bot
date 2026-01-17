@@ -18,17 +18,16 @@ class RobotMover(Node):
         self.OFFSET_X = 0.00  
         self.OFFSET_Y = 0.00  
         
-        # --- ALTEZZE ---
+        # --- ALTEZZE GEOMETRICHE ---
         self.ALTEZZA_BASE = 1.305      
         self.Z_TASELLO = 1.32          
-        self.Z_VOLO = self.Z_TASELLO + 0.35 
+        self.LUNGHEZZA_MANO = 0.22 
         
-        # Altezza presa (modifica se non tocca)
-        self.Z_PRESA = self.Z_TASELLO + 0.11
+        # Altezze target del POLSO (Wrist)
+        self.Z_POLSO_VOLO = (self.Z_TASELLO + self.LUNGHEZZA_MANO) + 0.25 
+        self.Z_POLSO_PRESA = (self.Z_TASELLO + self.LUNGHEZZA_MANO) + 0.11
         
-        # --- CONFIGURAZIONE DEBUG ---
-        # Tempo di attesa tra uno step e l'altro per permetterti di controllare
-        self.TEMPO_PAUSA_DEBUG = 5.0 
+        self.TEMPO_PAUSA_DEBUG = 3.0 
         
         self.L1 = 0.316
         self.L2 = 0.384
@@ -69,74 +68,64 @@ class RobotMover(Node):
         self.last_target_y = msg.y
         
         self.get_logger().info(f'TARGET ACQUISITO: X={msg.x:.3f} Y={msg.y:.3f}')
-        
         mission = threading.Thread(target=self.esegui_presa_diretta, args=(msg.x, msg.y))
         mission.start()
 
     def pausa_debug(self):
-        """Funzione helper per fermare il robot tra gli step"""
-        self.get_logger().warn(f'[PAUSA ISPEZIONE] Fermo per {self.TEMPO_PAUSA_DEBUG} secondi...')
+        self.get_logger().warn(f'[DEBUG] Pausa {self.TEMPO_PAUSA_DEBUG}s...')
         time.sleep(self.TEMPO_PAUSA_DEBUG)
 
     def esegui_presa_diretta(self, raw_x, raw_y):
         tx = (raw_x * self.MOLTIPLICATORE_X) + self.OFFSET_X
         ty = (raw_y * self.MOLTIPLICATORE_Y) + self.OFFSET_Y
-        
         drop_x = 0.5 * self.MOLTIPLICATORE_X
         drop_y = 0.0 
         
-        # --- STEP 1: APPROCCIO ---
-        self.get_logger().info(f'--> 1. VADO SOPRA IL TASSELLO (X={tx:.3f}, Y={ty:.3f})')
-        q_approccio = self.calcola_ik_stable(tx, ty, self.Z_VOLO)
-        if q_approccio: self.muovi_braccio(q_approccio, 4.0)
-        time.sleep(4.5) # Aspetta fine movimento
-        self.pausa_debug() # <--- PAUSA QUI
+        # 1. VOLO
+        self.get_logger().info(f'--> 1. VOLO (Z_Polso={self.Z_POLSO_VOLO:.2f})')
+        q_approccio = self.calcola_ik_stable(tx, ty, self.Z_POLSO_VOLO)
+        if q_approccio: 
+            self.muovi_braccio(q_approccio, 4.0)
+            time.sleep(4.5)
+            self.pausa_debug() 
         
-        # --- STEP 2: APERTURA ---
-        self.get_logger().info('--> 2. APERTURA PINZA')
+        # 2. APERTURA
+        self.get_logger().info('--> 2. APERTURA')
         self.muovi_pinza(0.04) 
         time.sleep(0.5)
-        # (Qui non metto pausa lunga perchè la pinza è veloce)
         
-        # --- STEP 3: DISCESA ---
-        self.get_logger().info(f'--> 3. DISCESA FINALE A Z={self.Z_PRESA:.3f}')
-        q_giu = self.calcola_ik_stable(tx, ty, self.Z_PRESA)
-        if q_giu: self.muovi_braccio(q_giu, 3.0) 
-        time.sleep(3.5)
-        self.pausa_debug() # <--- PAUSA CRUCIALE: Controlla se tocca il tassello!
+        # 3. DISCESA
+        self.get_logger().info(f'--> 3. DISCESA (Z_Polso={self.Z_POLSO_PRESA:.2f})')
+        q_giu = self.calcola_ik_stable(tx, ty, self.Z_POLSO_PRESA)
+        if q_giu: 
+            self.muovi_braccio(q_giu, 3.0) 
+            time.sleep(3.5)
+            self.pausa_debug() # ORA LA MANO DOVREBBE ESSERE DRITTA!
         
-        # --- STEP 4: CHIUSURA ---
-        self.get_logger().info('--> 4. CHIUSURA (GRASP)')
+        # 4. PRESA
+        self.get_logger().info('--> 4. CHIUSURA')
         self.muovi_pinza(0.0) 
         time.sleep(1.0) 
-        self.pausa_debug() # <--- PAUSA: Controlla se l'ha preso
+        self.pausa_debug() 
         
-        # --- STEP 5: RISALITA ---
+        # 5. RISALITA
         self.get_logger().info('--> 5. RISALITA')
         if q_approccio: self.muovi_braccio(q_approccio, 2.0)
         time.sleep(2.5)
         
-        # --- STEP 6: TRASPORTO ---
-        self.get_logger().info(f'--> 6. TRASPORTO E DEPOSITO')
-        q_drop = self.calcola_ik_stable(drop_x, drop_y, self.Z_VOLO)
+        # 6. DEPOSITO
+        self.get_logger().info(f'--> 6. DEPOSITO')
+        q_drop = self.calcola_ik_stable(drop_x, drop_y, self.Z_POLSO_VOLO)
         if q_drop:
-            q_drop[6] += 1.57
+            q_drop[6] += 1.57 # Ruota polso
             self.muovi_braccio(q_drop, 4.0)
         time.sleep(4.5)
-        self.pausa_debug() # <--- PAUSA
+        self.pausa_debug() 
         
-        # Discesa deposito
-        q_drop_low = self.calcola_ik_stable(drop_x, drop_y, self.Z_PRESA + 0.02)
-        if q_drop_low:
-            q_drop_low[6] += 1.57
-            self.muovi_braccio(q_drop_low, 2.0)
-        time.sleep(2.5)
-        
-        self.muovi_pinza(0.04) # Rilascia
+        self.muovi_pinza(0.04) 
         time.sleep(1.0)
         
-        # --- STEP 7: HOME ---
-        self.get_logger().info('--> 7. RITORNO HOME')
+        self.get_logger().info('--> 7. HOME')
         self.muovi_braccio(self.HOME_POS, 4.0)
         time.sleep(4.0)
         
@@ -160,11 +149,12 @@ class RobotMover(Node):
         if self.gripper_client.wait_for_server(timeout_sec=0.5):
             self.gripper_client.send_goal_async(goal)
 
-    def calcola_ik_stable(self, x, y, z_desiderata):
-        z_rel = z_desiderata - 0.33 - self.ALTEZZA_BASE
+    def calcola_ik_stable(self, x, y, z_wrist_abs):
+        z_rel = z_wrist_abs - (self.ALTEZZA_BASE + 0.33)
         theta1 = math.atan2(y, x)
-        r = math.sqrt(x**2 + y**2) - 0.05 
+        r = math.sqrt(x**2 + y**2) 
         d = math.sqrt(r**2 + z_rel**2)
+        
         if d > (self.L1 + self.L2): d = self.L1 + self.L2 - 0.001
         
         cos_theta4 = (self.L1**2 + self.L2**2 - d**2) / (2 * self.L1 * self.L2)
@@ -175,7 +165,17 @@ class RobotMover(Node):
         val_acos = max(-1.0, min(1.0, val_acos))
         theta2 = math.atan2(z_rel, r) + math.acos(val_acos)
         
-        return [theta1, theta2, 0.0, theta4, 0.0, 2.2, 0.79]
+        # --- FIX DEFINITIVO MANO ---
+        # Formula geometrica: per puntare in basso (-90 gradi),
+        # il polso (J6) deve compensare l'inclinazione di spalla e gomito.
+        # J6 = (theta2 + theta4) + 90 gradi
+        theta6 = (theta2 + theta4) + 1.57
+        
+        # Controllo di sicurezza per il giunto Panda (Range -0.01 a 3.75)
+        if theta6 < 0.0: theta6 = 0.0
+        if theta6 > 3.75: theta6 = 3.75
+            
+        return [theta1, theta2, 0.0, theta4, 0.0, theta6, 0.79]
 
 def main(args=None):
     rclpy.init(args=args)
