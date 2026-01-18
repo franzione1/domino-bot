@@ -38,7 +38,12 @@ def generate_launch_description():
     spawn_domino1 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_rg', '-file', domino_rg, '-x', '0.5', '-y', '0.0', '-z', z_height], output='screen')
     spawn_domino2 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_gb', '-file', domino_gb, '-x', '0.5', '-y', '0.2', '-z', z_height], output='screen')
     spawn_domino3 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_br', '-file', domino_br, '-x', '0.5', '-y', '-0.2', '-z', z_height], output='screen')
-
+    
+    panda_hand_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner.py", 
+        arguments=["panda_hand_controller"],
+    )
     return LaunchDescription([
         panda_simulation,
         TimerAction(period=5.0, actions=[spawn_table]),
@@ -48,4 +53,5 @@ def generate_launch_description():
         # SEQUENZA PINZA RITARDATA
         # Aumentiamo un po' il ritardo per dare tempo al controller manager di svegliarsi
         TimerAction(period=22.0, actions=[spawn_gripper_controller]),
+        panda_hand_controller_spawner,
     ])
