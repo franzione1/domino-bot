@@ -15,7 +15,7 @@ class RobotMover(Node):
         # --- PARAMETRI DI CALIBRAZIONE ---
         self.MOLTIPLICATORE_X = 1.0  
         self.MOLTIPLICATORE_Y = -1.0 
-        self.OFFSET_X = 0.00  
+        self.OFFSET_X = -0.03 
         self.OFFSET_Y = 0.00  
         
         # --- ALTEZZE GEOMETRICHE ---
