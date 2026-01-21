@@ -21,12 +21,6 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(os.path.join(panda_pkg, 'launch', 'panda_simulation.launch.py'))
     )
 
-    # Avvio Controller Pinza (CORREZIONE QUI: 'start' invece di 'active')
-    spawn_gripper_controller = ExecuteProcess(
-        cmd=['ros2', 'control', 'load_controller', 'panda_hand_controller', '--set-state', 'start'],
-        output='screen'
-    )
-
     # Spawners Oggetti
     spawn_table = Node(package='gazebo_ros', executable='spawn_entity.py',
         arguments=['-entity', 'work_table', '-file', table_sdf, '-x', '0.7', '-y', '0.0', '-z', '0.8'], output='screen')
@@ -39,19 +33,50 @@ def generate_launch_description():
     spawn_domino2 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_gb', '-file', domino_gb, '-x', '0.5', '-y', '0.2', '-z', z_height], output='screen')
     spawn_domino3 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_br', '-file', domino_br, '-x', '0.5', '-y', '-0.2', '-z', z_height], output='screen')
     
+# --- SPAWNER PER IL BRACCIO E STATI ---
+    
+    # 1. Joint State Broadcaster (Pubblica gli stati dei giunti su /joint_states)
+    joint_state_broadcaster_spawner = Node(
+        package="controller_manager",
+        executable="spawner.py", # Ricorda il .py per Foxy
+        arguments=["joint_state_broadcaster"],
+    )
+
+    # 2. Arm Controller (Il controller principale del braccio)
+    panda_arm_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner.py",
+        arguments=["panda_arm_controller"],
+    )
+
+    # 3. Hand Controller (Quello che avevi già)
     panda_hand_controller_spawner = Node(
         package="controller_manager",
-        executable="spawner.py", 
+        executable="spawner.py",
         arguments=["panda_hand_controller"],
     )
+
     return LaunchDescription([
         panda_simulation,
         TimerAction(period=5.0, actions=[spawn_table]),
         TimerAction(period=6.0, actions=[spawn_camera]),
         TimerAction(period=8.0, actions=[spawn_domino1, spawn_domino2, spawn_domino3]),
         
-        # SEQUENZA PINZA RITARDATA
-        # Aumentiamo un po' il ritardo per dare tempo al controller manager di svegliarsi
-        TimerAction(period=22.0, actions=[spawn_gripper_controller]),
-        panda_hand_controller_spawner,
+# --- SEQUENZA DI AVVIO AUTOMATICA ---
+        
+        # STEP 1: Aspetta 5 secondi che Gazebo sia pronto, poi lancia gli stati e il braccio
+        TimerAction(
+            period=5.0,
+            actions=[
+                joint_state_broadcaster_spawner,
+                panda_arm_controller_spawner
+            ]
+        ),
+
+        # STEP 2: Aspetta altri secondi (totale 10 o più) e lancia la mano
+        # (Oppure puoi metterli tutti insieme nel timer sopra, ma separarli a volte è più stabile)
+        TimerAction(
+            period=10.0,
+            actions=[panda_hand_controller_spawner]
+        ),
     ])
