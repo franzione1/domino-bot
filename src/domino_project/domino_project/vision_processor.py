@@ -5,13 +5,13 @@ from geometry_msgs.msg import Point
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+import math
 
-class DominoDetector(Node):
+class SmartDominoVision(Node):
     def __init__(self):
-        super().__init__('domino_detector')
+        super().__init__('smart_domino_vision')
         
-        # PARAMETRI CALIBRAZIONE
+        # --- CALIBRAZIONE ---
         self.CAMERA_X = 0.7      
         self.CAMERA_Y = 0.0      
         self.IMG_CENTER_X = 400  
@@ -19,93 +19,138 @@ class DominoDetector(Node):
         self.SCALE_X = -0.00183  
         self.SCALE_Y = -0.00073  
 
-        # QoS
-        qos_policy = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10
-        )
+        # --- COLORI (HSV) ---
+        self.COLORS = {
+            "ROSSO": [
+                (np.array([0, 70, 50]), np.array([10, 255, 255])),
+                (np.array([160, 70, 50]), np.array([180, 255, 255]))
+            ],
+            "BLU": [
+                (np.array([90, 50, 50]), np.array([140, 255, 255]))
+            ],
+            "VERDE": [
+                (np.array([35, 50, 50]), np.array([85, 255, 255]))
+            ]
+        }
 
         self.subscription = self.create_subscription(
-            Image,
-            '/table_camera/image_raw',
-            self.image_callback,
-            qos_policy)
+            Image, '/table_camera/image_raw', self.image_callback, 10)
             
-        # PUBLISHER (Reliable per essere sicuri che arrivi)
         self.coord_pub = self.create_publisher(Point, '/domino_position', 10)
-            
         self.bridge = CvBridge()
-        self.get_logger().info('Visione Debug Attiva! Cerco tasselli ROSSI...')
+        self.last_print_time = 0
+        self.get_logger().info('Visione Debug: Parametri Rilassati...')
 
     def image_callback(self, msg):
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        except Exception as e:
-            return
+        except: return
 
         hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-
-        # Maschera ROSSO (Ampia)
-        lower_red1 = np.array([0, 70, 50])
-        upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([160, 70, 50])
-        upper_red2 = np.array([180, 255, 255])
-        mask_red = cv2.bitwise_or(cv2.inRange(hsv_image, lower_red1, upper_red1), 
-                                  cv2.inRange(hsv_image, lower_red2, upper_red2))
-
-        # Passiamo solo il rosso al processore
-        self.process_color(cv_image, mask_red, (0, 0, 255), "ROSSO")
+        blobs = [] 
         
-        cv2.imshow("Robot View - Debug", cv_image)
+        # 1. RILEVAZIONE
+        for color_name, ranges in self.COLORS.items():
+            mask = np.zeros(hsv_image.shape[:2], dtype="uint8")
+            for (lower, upper) in ranges:
+                mask = cv2.bitwise_or(mask, cv2.inRange(hsv_image, lower, upper))
+            
+            kernel = np.ones((3,3), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                if cv2.contourArea(c) > 300: 
+                    M = cv2.moments(c)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        rx, ry = self.pixel_to_real(cx, cy)
+                        
+                        # Disegno solo per debug
+                        color_rgb = (0, 255, 0) if color_name == "VERDE" else ((255, 0, 0) if color_name == "BLU" else (0, 0, 255))
+                        cv2.drawContours(cv_image, [c], -1, color_rgb, 2)
+                        cv2.putText(cv_image, f"{color_name}", (cx-20, cy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+
+                        blobs.append({'colore': color_name, 'cx': cx, 'cy': cy, 'rx': rx, 'ry': ry, 'contour': c})
+
+        # --- LOGICA CENTRO ---
+        # Definiamo dove ci aspettiamo sia il centro del tavolo.
+        # Se ti prende il pezzo a destra, prova a modificare questi valori leggermente.
+        centro_atteso_x = 0.50
+        centro_atteso_y = 0.00
+        
+        # Cerchiamo blob entro 2cm da questo punto
+        blobs_centrali = [b for b in blobs if math.sqrt((b['rx'] - centro_atteso_x)**2 + (b['ry'] - centro_atteso_y)**2) < 0.02]
+
+        if not blobs_centrali:
+            cv2.imshow("Smart Vision", cv_image)
+            cv2.waitKey(1)
+            return
+
+        # Ordiniamo per Y pixel (chi ha Y minore è "sopra" nell'immagine)
+        blobs_centrali.sort(key=lambda b: b['cy'])
+        blob_superiore = blobs_centrali[0] # Questo è il mezzo-domino "in alto"
+        colore_target = blob_superiore['colore']
+
+        # Evidenziamo chi abbiamo scelto come centro
+        cv2.circle(cv_image, (blob_superiore['cx'], blob_superiore['cy']), 20, (0, 255, 255), 3)
+        cv2.putText(cv_image, "CENTRO", (blob_superiore['cx']-30, blob_superiore['cy']-30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+        # 3. CERCA TARGET
+        blob_match = None
+        
+        # --- MODIFICA FONDAMENTALE: RIDOTTA DISTANZA MINIMA ---
+        distanza_minima = 0.05 # 5 cm (Prima era 20cm!)
+        
+        match_candidates = [] # Per debug
+
+        for b in blobs:
+            if b['colore'] == colore_target:
+                # Calcola distanza dal blob centrale che abbiamo scelto
+                d = math.sqrt((b['rx'] - blob_superiore['rx'])**2 + (b['ry'] - blob_superiore['ry'])**2)
+                
+                # Se è abbastanza lontano da non essere lo stesso pezzo, ma è dello stesso colore
+                if d > distanza_minima:
+                    blob_match = b
+                    match_candidates.append(f"Trovato a dist {d:.2f}")
+                    break
+                else:
+                    if d > 0.01: # Se non è se stesso (distanza > 1cm) ma < 8cm
+                         match_candidates.append(f"Scartato per dist {d:.2f} < {distanza_minima}")
+
+        # LOG DEBUG PERIODICO
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now - self.last_print_time > 2.0:
+            self.get_logger().info(f"Target: {colore_target} | Candidati visti: {match_candidates}")
+            self.last_print_time = now
+
+        if blob_match:
+            # DISEGNA LINEA DI COLLEGAMENTO
+            cv2.line(cv_image, (blob_superiore['cx'], blob_superiore['cy']), (blob_match['cx'], blob_match['cy']), (0, 255, 0), 3)
+            
+            p = Point()
+            p.x = blob_match['rx']
+            p.y = blob_match['ry']
+            self.coord_pub.publish(p)
+        else:
+            cv2.putText(cv_image, f"CERCO {colore_target}...", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        cv2.imshow("Smart Vision", cv_image)
         cv2.waitKey(1)
 
-    def process_color(self, image, mask, color, label):
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
-            return # Nessun contorno trovato
-
-        # Prendo il contorno più grande per evitare rumore
-        largest_contour = max(contours, key=cv2.contourArea)
-            
-        if cv2.contourArea(largest_contour) > 500: # Filtro rumore aumentato
-            cv2.drawContours(image, [largest_contour], -1, color, 2)
-            
-            M = cv2.moments(largest_contour)
-            if M["m00"] != 0:
-                cX = int(M["m10"] / M["m00"])
-                cY = int(M["m01"] / M["m00"])
-
-                real_x = self.CAMERA_X + (cY - self.IMG_CENTER_Y) * self.SCALE_X
-                real_y = self.CAMERA_Y + (cX - self.IMG_CENTER_X) * self.SCALE_Y
-                
-                coord_text = f"X:{real_x:.2f} Y:{real_y:.2f}"
-                cv2.putText(image, coord_text, (cX - 50, cY - 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                
-                # --- INVIO MESSAGGIO ---
-                point_msg = Point()
-                point_msg.x = real_x
-                point_msg.y = real_y
-                point_msg.z = 1.32
-                
-                self.coord_pub.publish(point_msg)
-                
-                # LOG DI DEBUG: Se non vedi questo, non sta inviando!
-                self.get_logger().info(f'[PUBBLICO] {label} a X={real_x:.2f}, Y={real_y:.2f}')
+    def pixel_to_real(self, u, v):
+        real_x = self.CAMERA_X + (v - self.IMG_CENTER_Y) * self.SCALE_X
+        real_y = self.CAMERA_Y + (u - self.IMG_CENTER_X) * self.SCALE_Y
+        return real_x, real_y
 
 def main(args=None):
     rclpy.init(args=args)
-    node = DominoDetector()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-        cv2.destroyAllWindows()
+    node = SmartDominoVision()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+    cv2.destroyAllWindows()
 
 if __name__ == '__main__':
     main()

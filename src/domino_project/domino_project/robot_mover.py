@@ -3,6 +3,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from control_msgs.action import GripperCommand
+from geometry_msgs.msg import Point # <--- Importiamo il tipo di messaggio per le coordinate
 import math
 import time
 import threading
@@ -11,98 +12,115 @@ class RobotMover(Node):
     def __init__(self):
         super().__init__('robot_mover')
         
+        # --- CONFIGURAZIONE BRACCIO E PINZA ---
         self.arm_publisher = self.create_publisher(JointTrajectory, '/panda_arm_controller/joint_trajectory', 10)
         self.gripper_client = ActionClient(self, GripperCommand, '/panda_hand_controller/gripper_cmd')
+        
+        # --- SUBSCRIBER VISIONE ---
+        # Il robot si mette in ascolto sul topic che hai trovato
+        self.vision_subscription = self.create_subscription(
+            Point, 
+            '/domino_position', 
+            self.vision_callback, 
+            10
+        )
         
         self.joint_names = [
             'panda_joint1', 'panda_joint2', 'panda_joint3', 
             'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7'
         ]
         
-        # --- CONFIGURAZIONE ---
+        # --- PARAMETRI GEOMETRICI ---
         self.HOME_POS = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
         self.L1 = 0.316
         self.L2 = 0.384
         self.OFFSET_SPALLA = 0.33
-        
         self.LUNGHEZZA_MANO = 0.22 
         self.Z_MINIMA_SICUREZZA = 0.24 
         
-        # Target (Coordinate Mattoncino)
-        self.target_x = 0.55
-        self.target_y = -0.15 
-        
-        # Correzione Mira Base
-        self.CORREZIONE_J1 = -0.05 
-        
-        # --- PARAMETRO DI ALLINEAMENTO AL DOMINO ---
-        # Questo è l'angolo che il polso dovrebbe avere se il robot fosse dritto (J1=0).
-        # Solitamente 1.57 (90°) o 0.78 (45°) o 2.35 (135°) a seconda di come è girato il pezzo.
-        # Prova 1.57. Se arriva ancora storto (es. parallelo al pezzo invece che perpendicolare),
-        # cambia questo valore aggiungendo o togliendo 90 gradi (+/- 1.57).
+        # Tuning
+        self.CORREZIONE_J1 = 0.0
         self.ALLINEAMENTO_BASE_POLSO = 1.57 
         
-        self.get_logger().info('Avvio: MISSIONE CON COMPENSAZIONE ROTAZIONE')
-        threading.Thread(target=self.missione_completa).start()
+        # Stato del Robot
+        self.is_busy = False # Per evitare che parta 10 volte se arrivano 10 messaggi
+        
+        self.get_logger().info('NODO PRONTO: In attesa di coordinate su /domino_position ...')
 
-    def missione_completa(self):
-        time.sleep(1.0)
+    def vision_callback(self, msg):
+        """
+        Questa funzione scatta AUTOMATICAMENTE ogni volta che 
+        la telecamera pubblica un messaggio.
+        """
+        if self.is_busy:
+            return # Se stiamo già prendendo un pezzo, ignoriamo i nuovi messaggi
 
+        self.get_logger().info(f'!!! TROVATO DOMINO !!! Coordinate ricevute: X={msg.x:.3f}, Y={msg.y:.3f}')
+        
+        # Controllo di sicurezza: se la cam dà 0,0 (errore) o valori assurdi, ignoriamo
+        if msg.x == 0.0 and msg.y == 0.0:
+            return
+            
+        distanza = math.sqrt(msg.x**2 + msg.y**2)
+        if distanza > 0.85: # Fuori dalla portata del braccio
+            self.get_logger().warn('Target troppo lontano! Ignorato.')
+            return
+
+        # Impostiamo il flag occupato e avviamo la missione in un thread separato
+        self.is_busy = True
+        
+        # Passiamo le coordinate al thread
+        threading.Thread(target=self.esegui_missione, args=(msg.x, msg.y)).start()
+
+    def esegui_missione(self, target_x, target_y):
+        self.get_logger().info(f'--> AVVIO MOVIMENTO verso X={target_x}, Y={target_y}')
+        
         # 0. HOME
-        self.get_logger().info('--> FASE 0: HOME')
         self.muovi_home()
         time.sleep(4.0)
         
-        # 1. APERTURA
-        self.get_logger().info('--> FASE 1: APERTURA')
+        # 1. APERTURA PINZA
         self.muovi_pinza(0.04)
         time.sleep(2.0)
 
-        # CALCOLO J1
-        theta1 = math.atan2(self.target_y, self.target_x) + self.CORREZIONE_J1
+        # --- CALCOLI CINEMATICA ---
+        theta1 = math.atan2(target_y, target_x) + self.CORREZIONE_J1
         
-        # --- CALCOLO J7 (Compensazione) ---
-        # La rotazione finale del polso deve cancellare la rotazione della base (theta1)
-        # per mantenere l'orientamento assoluto rispetto al tavolo.
+        # Compensazione rotazione polso (per mantenerlo perpendicolare)
         theta7_compensato = self.ALLINEAMENTO_BASE_POLSO - theta1
         
-        self.get_logger().info(f'Base J1: {theta1:.2f} -> Polso J7 Compensato: {theta7_compensato:.2f}')
-        
         # 2. APPROCCIO ALTO
-        self.get_logger().info('--> FASE 2: AVVICINAMENTO')
-        # Arriviamo già con il polso ruotato correttamente
-        self.muovi_orizzontale(theta1, z_altezza_presa=0.35, rotazione_j7=theta7_compensato)
+        self.muovi_orizzontale(target_x, target_y, 0.35, theta1, theta7_compensato)
         time.sleep(4.0)
         
         # 3. DISCESA
-        self.get_logger().info(f'--> FASE 3: DISCESA (Z={self.Z_MINIMA_SICUREZZA})')
-        self.muovi_orizzontale(theta1, z_altezza_presa=self.Z_MINIMA_SICUREZZA, rotazione_j7=theta7_compensato) 
+        self.muovi_orizzontale(target_x, target_y, self.Z_MINIMA_SICUREZZA, theta1, theta7_compensato) 
         time.sleep(4.0)
         
-        # 4. PRESA
-        self.get_logger().info('--> FASE 4: CHIUSURA')
+        # 4. PRESA (Chiude a 1cm per sicurezza)
         self.muovi_pinza(0.01) 
         time.sleep(2.0)
         
         # 5. SOLLEVAMENTO
-        self.get_logger().info('--> FASE 5: SOLLEVAMENTO')
-        self.muovi_orizzontale(theta1, z_altezza_presa=0.35, rotazione_j7=theta7_compensato)
+        self.muovi_orizzontale(target_x, target_y, 0.35, theta1, theta7_compensato)
         time.sleep(4.0)
         
         # 6. RITORNO
-        self.get_logger().info('--> FASE 6: RITORNO HOME')
         self.muovi_home()
-        self.get_logger().info('Missione Completata!')
+        self.get_logger().info('MISSIONE COMPLETATA! Torno in ascolto...')
+        
+        # Rilasciamo il flag: ora il robot è pronto per un nuovo messaggio
+        self.is_busy = False 
 
+    # --- FUNZIONI DI MOVIMENTO ---
     def muovi_home(self):
         self.muovi_braccio(self.HOME_POS, durata=4.0)
 
-    def muovi_orizzontale(self, theta1, z_altezza_presa, rotazione_j7):
-        if z_altezza_presa < self.Z_MINIMA_SICUREZZA:
-            z_altezza_presa = self.Z_MINIMA_SICUREZZA
-
-        z_rel = z_altezza_presa - self.OFFSET_SPALLA
-        r_polso = math.sqrt(self.target_x**2 + self.target_y**2) - self.LUNGHEZZA_MANO
+    def muovi_orizzontale(self, x, y, z, theta1, rotazione_j7):
+        # Logica cinematica inversa
+        if z < self.Z_MINIMA_SICUREZZA: z = self.Z_MINIMA_SICUREZZA
+        z_rel = z - self.OFFSET_SPALLA
+        r_polso = math.sqrt(x**2 + y**2) - self.LUNGHEZZA_MANO
         d = math.sqrt(r_polso**2 + z_rel**2)
         
         if d > (self.L1 + self.L2): d = self.L1 + self.L2 - 0.001
@@ -117,8 +135,7 @@ class RobotMover(Node):
         theta6 = -1.0 * (theta2_geom + theta4)
         theta6 = max(0.01, min(3.75, theta6))
 
-        # Assicuriamoci che J7 rimanga nei limiti fisici del Panda (-2.89 a +2.89)
-        # Se la matematica lo manda fuori, lo riportiamo nel range corretto
+        # Normalizzazione J7
         if rotazione_j7 > 2.89: rotazione_j7 -= 3.14
         if rotazione_j7 < -2.89: rotazione_j7 += 3.14
 
@@ -139,15 +156,17 @@ class RobotMover(Node):
         goal = GripperCommand.Goal()
         goal.command.position = apertura
         goal.command.max_effort = 100.0
-        
-        if not self.gripper_client.wait_for_server(timeout_sec=5.0):
-            return
+        if not self.gripper_client.wait_for_server(timeout_sec=5.0): return
         self.gripper_client.send_goal_async(goal)
 
 def main(args=None):
     rclpy.init(args=args)
     node = RobotMover()
-    rclpy.spin(node)
+    # rclpy.spin è fondamentale: mantiene il programma vivo per ascoltare i messaggi
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     node.destroy_node()
     rclpy.shutdown()
 
