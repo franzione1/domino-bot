@@ -76,7 +76,7 @@ def generate_launch_description():
         # STEP 2: Aspetta altri secondi (totale 10 o più) e lancia la mano
         # (Oppure puoi metterli tutti insieme nel timer sopra, ma separarli a volte è più stabile)
         TimerAction(
-            period=10.0,
+            period=20.0,
             actions=[panda_hand_controller_spawner]
         ),
     ])

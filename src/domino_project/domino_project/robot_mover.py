@@ -3,7 +3,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from control_msgs.action import GripperCommand
-from geometry_msgs.msg import Point # <--- Importiamo il tipo di messaggio per le coordinate
+from geometry_msgs.msg import Point 
 import math
 import time
 import threading
@@ -17,7 +17,6 @@ class RobotMover(Node):
         self.gripper_client = ActionClient(self, GripperCommand, '/panda_hand_controller/gripper_cmd')
         
         # --- SUBSCRIBER VISIONE ---
-        # Il robot si mette in ascolto sul topic che hai trovato
         self.vision_subscription = self.create_subscription(
             Point, 
             '/domino_position', 
@@ -30,8 +29,18 @@ class RobotMover(Node):
             'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7'
         ]
         
-        # --- PARAMETRI GEOMETRICI ---
+        # --- POSIZIONI PREDEFINITE ---
+        
+        # 1. HOME NEUTRA (Alta e indietro): 
+        # Serve per non impallare la telecamera mentre cerca i pezzi.
         self.HOME_POS = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+
+        # 2. READY POS (Verticale sul tavolo): 
+        # Il robot si mette qui appena inizia la missione, pronto a scendere.
+        # J4=-1.57 (gomito 90), J6=1.57 (polso dritto), J7=1.57 (dita per lato lungo)
+        self.READY_POS = [0.0, 0.0, 0.0, -1.571, 0.0, 1.571, 1.571]
+
+        # --- PARAMETRI GEOMETRICI ---
         self.L1 = 0.316
         self.L2 = 0.384
         self.OFFSET_SPALLA = 0.33
@@ -42,80 +51,75 @@ class RobotMover(Node):
         self.CORREZIONE_J1 = 0.0
         self.ALLINEAMENTO_BASE_POLSO = 1.57 
         
-        # Stato del Robot
-        self.is_busy = False # Per evitare che parta 10 volte se arrivano 10 messaggi
+        self.is_busy = False 
         
-        self.get_logger().info('NODO PRONTO: In attesa di coordinate su /domino_position ...')
+        # All'avvio, andiamo subito in posizione neutra per lasciar vedere la cam
+        self.muovi_braccio(self.HOME_POS, durata=5.0)
+        self.get_logger().info('NODO PRONTO: Posizione Home raggiunta. In attesa di coordinate...')
 
     def vision_callback(self, msg):
-        """
-        Questa funzione scatta AUTOMATICAMENTE ogni volta che 
-        la telecamera pubblica un messaggio.
-        """
         if self.is_busy:
-            return # Se stiamo già prendendo un pezzo, ignoriamo i nuovi messaggi
+            return 
 
-        self.get_logger().info(f'!!! TROVATO DOMINO !!! Coordinate ricevute: X={msg.x:.3f}, Y={msg.y:.3f}')
+        self.get_logger().info(f'!!! TROVATO DOMINO !!! Coordinate: X={msg.x:.3f}, Y={msg.y:.3f}')
         
-        # Controllo di sicurezza: se la cam dà 0,0 (errore) o valori assurdi, ignoriamo
         if msg.x == 0.0 and msg.y == 0.0:
             return
             
         distanza = math.sqrt(msg.x**2 + msg.y**2)
-        if distanza > 0.85: # Fuori dalla portata del braccio
+        if distanza > 0.85: 
             self.get_logger().warn('Target troppo lontano! Ignorato.')
             return
 
-        # Impostiamo il flag occupato e avviamo la missione in un thread separato
         self.is_busy = True
-        
-        # Passiamo le coordinate al thread
         threading.Thread(target=self.esegui_missione, args=(msg.x, msg.y)).start()
 
     def esegui_missione(self, target_x, target_y):
-        self.get_logger().info(f'--> AVVIO MOVIMENTO verso X={target_x}, Y={target_y}')
+        self.get_logger().info(f'--> AVVIO PIPELINE per X={target_x}, Y={target_y}')
         
-        # 0. HOME
-        self.muovi_home()
-        time.sleep(4.0)
+        # FASE 1: POSIZIONAMENTO VERTICALE (READY)
+        # Il robot si porta al centro, braccio verticale verso il tavolo
+        self.get_logger().info('1. Vado in posizione di PRONTI (Verticale)...')
+        self.muovi_braccio(self.READY_POS, durata=3.0)
+        time.sleep(3.5) 
         
-        # 1. APERTURA PINZA
+        # FASE 2: PREPARAZIONE PINZA
+        # "Si ferma, apre le dita"
+        self.get_logger().info('2. Apro la pinza...')
         self.muovi_pinza(0.04)
-        time.sleep(2.0)
+        time.sleep(1.5)
 
-        # --- CALCOLI CINEMATICA ---
+        # FASE 3: CALCOLO E ROTAZIONE VERSO IL TARGET
         theta1 = math.atan2(target_y, target_x) + self.CORREZIONE_J1
-        
-        # Compensazione rotazione polso (per mantenerlo perpendicolare)
         theta7_compensato = self.ALLINEAMENTO_BASE_POLSO - theta1
         
-        # 2. APPROCCIO ALTO
+        # Approccio Alto (Ruota la base e si estende sopra il pezzo)
+        self.get_logger().info('3. Ruoto verso il pezzo e avanzo...')
         self.muovi_orizzontale(target_x, target_y, 0.35, theta1, theta7_compensato)
-        time.sleep(4.0)
+        time.sleep(3.5)
         
-        # 3. DISCESA
+        # FASE 4: DISCESA E PRESA
+        self.get_logger().info('4. Scendo per la presa...')
         self.muovi_orizzontale(target_x, target_y, self.Z_MINIMA_SICUREZZA, theta1, theta7_compensato) 
-        time.sleep(4.0)
+        time.sleep(3.0)
         
-        # 4. PRESA (Chiude a 1cm per sicurezza)
-        self.muovi_pinza(0.01) 
-        time.sleep(2.0)
+        self.muovi_pinza(0.01) # Chiude
+        time.sleep(1.0)
         
-        # 5. SOLLEVAMENTO
+        # FASE 5: SOLLEVAMENTO
+        self.get_logger().info('5. Sollevo...')
         self.muovi_orizzontale(target_x, target_y, 0.35, theta1, theta7_compensato)
+        time.sleep(2.5)
+        
+        # FASE 6: RITORNO A HOME (NEUTRA)
+        # Torna indietro in alto per liberare la visuale alla telecamera
+        self.get_logger().info('6. Missione finita. Torno in HOME (Alta) per liberare la visuale.')
+        self.muovi_braccio(self.HOME_POS, durata=4.0)
         time.sleep(4.0)
         
-        # 6. RITORNO
-        self.muovi_home()
-        self.get_logger().info('MISSIONE COMPLETATA! Torno in ascolto...')
-        
-        # Rilasciamo il flag: ora il robot è pronto per un nuovo messaggio
         self.is_busy = False 
 
     # --- FUNZIONI DI MOVIMENTO ---
-    def muovi_home(self):
-        self.muovi_braccio(self.HOME_POS, durata=4.0)
-
     def muovi_orizzontale(self, x, y, z, theta1, rotazione_j7):
         # Logica cinematica inversa
         if z < self.Z_MINIMA_SICUREZZA: z = self.Z_MINIMA_SICUREZZA
@@ -140,7 +144,7 @@ class RobotMover(Node):
         if rotazione_j7 < -2.89: rotazione_j7 += 3.14
 
         target_pos = [theta1, theta2_robot, 0.0, theta4, 0.0, theta6, rotazione_j7] 
-        self.muovi_braccio(target_pos, durata=4.0)
+        self.muovi_braccio(target_pos, durata=3.0)
 
     def muovi_braccio(self, posizioni, durata):
         msg = JointTrajectory()
@@ -162,7 +166,6 @@ class RobotMover(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = RobotMover()
-    # rclpy.spin è fondamentale: mantiene il programma vivo per ascoltare i messaggi
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
