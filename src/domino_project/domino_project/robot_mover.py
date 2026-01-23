@@ -23,25 +23,22 @@ class RobotMover(Node):
         #                         SEZIONE CALIBRAZIONE (TUNING)
         # =========================================================================
         
-        # 1. POSIZIONI PREDEFINITE
+        # 1. POSIZIONE HOME (Neutra, in alto)
+        # J7 = 0.785 (45 gradi) è solo estetico per la posa di riposo, non influenza la presa.
         self.HOME_POS = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
         
-        # 2. CORREZIONI DI POSIZIONE (Se il braccio non arriva esattamente sul pezzo)
-        # Se cade corto, aumenta OFFSET_DISTANZA. Se cade lungo, diminuisci.
-        self.OFFSET_DISTANZA_REACH = 0.0  # metri (es: 0.02 aggiunge 2cm)
+        # 2. CALIBRAZIONE FINALE
+        # Dato che il tuo robot parte da 0.0 (allineato), lasciamo questo a 0.
+        self.OFFSET_J7_POLSO = 1.57
         
-        # 3. CORREZIONI DI ROTAZIONE BASE (J1)
-        # Se il braccio punta troppo a sinistra/destra rispetto al target
-        # Modifica questo valore a piccoli passi (es: 0.05 o -0.05)
+        # Se il braccio arriva corto o lungo, modifica questo (es. 0.02 per +2cm)
+        self.OFFSET_DISTANZA_REACH = 0.0
+        
+        # Se il braccio è storto rispetto al pezzo (sinistra/destra)
         self.OFFSET_J1_BASE = 0.0 
         
-        # 4. CORREZIONI DI ORIENTAMENTO POLSO (J7)
-        # Questo è l'angolo che le dita devono avere rispetto al MONDO (Tavolo).
-        # 1.57 (90°) = Dita lungo asse Y (Perpendicolari ai domino su X)
+        # Angolo target nel mondo (1.57 = 90 gradi = Perpendicolare ai pezzi su X)
         self.TARGET_WORLD_ANGLE = 1.57
-        
-        # Se le dita non sono ancora dritte, aggiungi un piccolo offset qui
-        self.OFFSET_J7_POLSO = 0.0 
         
         # =========================================================================
         
@@ -57,9 +54,9 @@ class RobotMover(Node):
         
         self.is_busy = False 
         
-        # Reset iniziale
+        # Reset iniziale verso Home
         self.muovi_braccio(self.HOME_POS, durata=5.0)
-        self.get_logger().info('ROBOT PRONTO. Tuning caricato.')
+        self.get_logger().info('ROBOT PRONTO. Parametri calibrati per start a 0.0.')
 
     def vision_callback(self, msg):
         if self.is_busy: return 
@@ -72,37 +69,33 @@ class RobotMover(Node):
     def esegui_missione(self, target_x, target_y):
         self.get_logger().info(f'--- MISSIONE: Target X={target_x:.3f}, Y={target_y:.3f} ---')
         
-        # --- CALCOLO ANGOLI CON CORREZIONI ---
-        # 1. Calcoliamo la rotazione della base necessaria per guardare il punto
+        # --- CALCOLO ANGOLI ---
         theta1 = math.atan2(target_y, target_x) + self.OFFSET_J1_BASE
         
-        # 2. Calcoliamo la compensazione per il polso
-        # Se la base gira a sinistra (+), il polso deve girare a destra (-) per restare dritto.
-        # Formula: Angolo_Mondo_Desiderato - Angolo_Base + Offset_Manuale
+        # Compensazione Polso: 90° - RotazioneBase + Offset
         theta7 = (self.TARGET_WORLD_ANGLE - theta1) + self.OFFSET_J7_POLSO
         
-        self.get_logger().info(f'Calcoli: J1={theta1:.2f} rad, J7_Compensato={theta7:.2f} rad')
+        self.get_logger().info(f'Calcoli: J1={theta1:.2f}, J7={theta7:.2f}')
 
-        # --- FASE 1: APPROCCIO ALTO ---
+        # 1. APPROCCIO ALTO
         self.muovi_cinematica(target_x, target_y, self.Z_ALTA, theta1, theta7)
         time.sleep(4.0)
         
-        # --- FASE 2: DISCESA ---
+        # 2. DISCESA
         self.muovi_pinza(0.04)
         time.sleep(1.0)
-        
         self.muovi_cinematica(target_x, target_y, self.Z_SICUREZZA, theta1, theta7)
         time.sleep(3.0)
         
-        # --- FASE 3: PRESA ---
+        # 3. PRESA
         self.muovi_pinza(0.01) 
         time.sleep(1.5)
         
-        # --- FASE 4: SOLLEVAMENTO ---
+        # 4. SOLLEVAMENTO
         self.muovi_cinematica(target_x, target_y, self.Z_ALTA, theta1, theta7)
         time.sleep(3.0)
         
-        # --- FASE 5: PIAZZAMENTO (Simulato) ---
+        # 5. PIAZZAMENTO (a sinistra del centro)
         dest_x = self.CENTER_X
         dest_y = self.CENTER_Y + 0.06
         
@@ -123,40 +116,29 @@ class RobotMover(Node):
         
         self.is_busy = False 
 
-    # --- FUNZIONE CINEMATICA PURA ---
-    # Ora prende theta1 e theta7 calcolati PRIMA, per non fare confusione
     def muovi_cinematica(self, x, y, z, theta1_cmd, theta7_cmd):
-        
-        # Protezione Z
         if z < self.Z_SICUREZZA: z = self.Z_SICUREZZA
-        
         z_rel = z - self.OFFSET_SPALLA
         
-        # Distanza planare dal centro (raggio)
-        # Aggiungiamo qui l'OFFSET_DISTANZA_REACH per correggere se il braccio è "corto"
+        # Calcolo raggio con correzione distanza
         r_totale = math.sqrt(x**2 + y**2) + self.OFFSET_DISTANZA_REACH
-        
         r_polso = r_totale - self.LUNGHEZZA_MANO
         d = math.sqrt(r_polso**2 + z_rel**2)
         
-        # Limite fisico
         if d > (self.L1 + self.L2): d = self.L1 + self.L2 - 0.001
             
-        # Teorema del coseno per il gomito (Joint 4)
         cos_t4 = (self.L1**2 + self.L2**2 - d**2) / (2 * self.L1 * self.L2)
         theta4 = -1.0 * (math.pi - math.acos(max(-1.0, min(1.0, cos_t4))))
 
-        # Calcolo spalla (Joint 2)
         val_acos = (self.L1**2 + d**2 - self.L2**2) / (2 * self.L1 * d)
         theta2_geom = math.atan2(z_rel, r_polso) + math.acos(max(-1.0, min(1.0, val_acos)))
         theta2_robot = (math.pi / 2) - theta2_geom
 
-        # Calcolo polso (Joint 6) per tenerlo verticale
         theta6 = -1.0 * (theta2_geom + theta4)
         
-        # Normalizzazione J7
-        while theta7_cmd > 2.89: theta7_cmd -= 3.14
-        while theta7_cmd < -2.89: theta7_cmd += 3.14
+        # Normalizzazione J7 (-PI a +PI)
+        while theta7_cmd > 3.14: theta7_cmd -= 6.28
+        while theta7_cmd < -3.14: theta7_cmd += 6.28
 
         target_pos = [theta1_cmd, theta2_robot, 0.0, theta4, 0.0, theta6, theta7_cmd] 
         self.muovi_braccio(target_pos, durata=3.0)
