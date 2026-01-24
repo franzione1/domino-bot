@@ -31,7 +31,7 @@ class RobotMover(Node):
         self.L2 = 0.384
         self.OFFSET_SPALLA = 0.33
         self.LUNGHEZZA_MANO = 0.22 
-        self.Z_SICUREZZA = 0.235
+        self.Z_SICUREZZA = 0.233
         self.Z_ALTA = 0.35        
         
         self.CENTER_X = 0.50
@@ -95,9 +95,9 @@ class RobotMover(Node):
         time.sleep(1.0)
         self.muovi_cinematica(target_x, target_y, self.Z_SICUREZZA, theta1_scelto, theta7_scelto)
         log_status("Discesa sul pezzo")
-        time.sleep(3.0)
+        time.sleep(5.0)
         
-        self.muovi_pinza(0.0265) # Chiusura pinza
+        self.muovi_pinza(0.015) # Chiusura pinza
         time.sleep(1.5)
         log_status("PRESA EFFETTUATA")
 
@@ -164,7 +164,7 @@ class RobotMover(Node):
     def muovi_pinza(self, apertura):
         goal = GripperCommand.Goal()
         goal.command.position = apertura
-        goal.command.max_effort = 100.0
+        goal.command.max_effort = 10000.0
         if not self.gripper_client.wait_for_server(timeout_sec=1.0): return
         self.gripper_client.send_goal_async(goal)
 

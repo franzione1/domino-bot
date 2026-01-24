@@ -25,7 +25,7 @@
         <surface>
           <friction>
             <ode>
-              <mu>100.0</mu>
+              <mu>1000.0</mu>
               <mu2>100.0</mu2>
               <fdir1>1 0 0</fdir1>
             </ode>
