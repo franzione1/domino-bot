@@ -5,20 +5,20 @@
     <link name="link">
       
       <inertial>
-        <mass>0.08</mass> <inertia>
-          <ixx>0.00003</ixx>
+        <mass>0.06</mass> <inertia>
+          <ixx>0.00001</ixx>
           <ixy>0</ixy>
           <ixz>0</ixz>
-          <iyy>0.00008</iyy>
+          <iyy>0.00004</iyy>
           <iyz>0</iyz>
-          <izz>0.00008</izz>
+          <izz>0.00004</izz>
         </inertia>
       </inertial>
 
       <collision name="collision">
         <geometry>
           <box>
-            <size>0.08 0.04 0.016</size> 
+            <size>0.06 0.03 0.02</size> 
           </box>
         </geometry>
         <surface>
@@ -32,10 +32,10 @@
       </collision>
 
       <visual name="visual_left">
-        <pose>-0.02 0 0 0 0 0</pose> 
+        <pose>-0.015 0 0 0 0 0</pose> 
         <geometry>
           <box>
-            <size>0.04 0.04 0.016</size> 
+            <size>0.03 0.03 0.02</size> 
           </box>
         </geometry>
         <material>
@@ -47,10 +47,10 @@
       </visual>
 
       <visual name="visual_right">
-        <pose>0.02 0 0 0 0 0</pose> 
+        <pose>0.015 0 0 0 0 0</pose> 
         <geometry>
           <box>
-            <size>0.04 0.04 0.016</size>
+            <size>0.03 0.03 0.02</size>
           </box>
         </geometry>
         <material>

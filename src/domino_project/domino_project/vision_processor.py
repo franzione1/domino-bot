@@ -12,11 +12,13 @@ class SmartDominoVision(Node):
     def __init__(self):
         super().__init__('smart_domino_vision')
         
-        # --- CALIBRAZIONE ---
+        # --- CALIBRAZIONE CAM ---
         self.CAMERA_X = 0.7      
         self.CAMERA_Y = 0.0      
         self.IMG_CENTER_X = 400  
         self.IMG_CENTER_Y = 400  
+        
+        # La scala non cambia (dipende dall'altezza della cam, non dalla grandezza dei pezzi)
         self.SCALE_X = -0.0020  
         self.SCALE_Y = -0.0020  
 
@@ -34,7 +36,6 @@ class SmartDominoVision(Node):
             ]
         }
         
-        # Mappiamo i colori su numeri per inviarli al robot tramite la Z
         self.COLOR_CODES = { "ROSSO": 1.0, "VERDE": 2.0, "BLU": 3.0 }
 
         # QoS Gazebo
@@ -44,7 +45,7 @@ class SmartDominoVision(Node):
         
         self.bridge = CvBridge()
         self.last_print_time = 0
-        self.get_logger().info('VISION: Avviato. Invio codice colore su Z.')
+        self.get_logger().info('VISION: Calibrata per MINI-DOMINO (Area > 80px).')
 
     def image_callback(self, msg):
         try:
@@ -58,11 +59,16 @@ class SmartDominoVision(Node):
             mask = np.zeros(hsv_image.shape[:2], dtype="uint8")
             for (lower, upper) in ranges:
                 mask = cv2.bitwise_or(mask, cv2.inRange(hsv_image, lower, upper))
+            
             kernel = np.ones((3,3), np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for c in contours:
-                if cv2.contourArea(c) > 300: 
+                # --- MODIFICA FONDAMENTALE ---
+                # Prima era > 300. I nuovi pezzi sono molto più piccoli.
+                # Abbassiamo a 80 per essere sicuri di vederli.
+                if cv2.contourArea(c) > 80: 
                     M = cv2.moments(c)
                     if M["m00"] != 0:
                         cx = int(M["m10"] / M["m00"])
@@ -75,7 +81,7 @@ class SmartDominoVision(Node):
             cv2.waitKey(1)
             return
 
-        # Trova Centrale
+        # Trova Centrale (0.50, 0.00)
         blobs.sort(key=lambda b: math.sqrt((b['rx'] - 0.50)**2 + (b['ry'] - 0.00)**2))
         central_blob = blobs[0]
         cv2.circle(cv_image, (central_blob['cx'], central_blob['cy']), 15, (0, 255, 255), 3)
@@ -85,7 +91,9 @@ class SmartDominoVision(Node):
         for b in blobs:
             if b == central_blob: continue
             if b['colore'] == central_blob['colore']:
-                if math.sqrt((b['rx'] - central_blob['rx'])**2 + (b['ry'] - central_blob['ry'])**2) > 0.05:
+                # --- MODIFICA SECONDARIA ---
+                # Abbassata la distanza minima a 4cm (0.04) perché i pezzi sono lunghi 6cm
+                if math.sqrt((b['rx'] - central_blob['rx'])**2 + (b['ry'] - central_blob['ry'])**2) > 0.04:
                     target_blob = b
                     break
         
@@ -96,7 +104,6 @@ class SmartDominoVision(Node):
             p = Point()
             p.x = target_blob['rx']
             p.y = target_blob['ry']
-            # --- MODIFICA: Inviamo il codice colore su Z ---
             p.z = self.COLOR_CODES.get(target_blob['colore'], 0.0) 
             self.coord_pub.publish(p)
             
