@@ -19,18 +19,14 @@ class RobotMover(Node):
         
         self.joint_names = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7']
         
-        # --- CALIBRAZIONE ---
+        # --- TUNING ---
         self.HOME_POS = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
         
-        # IMPORTANTE: Ora che la visione è corretta, prova prima con 0.0!
-        # Se noti che il robot cade sempre a SINISTRA di 1cm, metti 0.01.
-        self.L_OFFSET_LATERALE = 0.01
-        
-        self.OFFSET_J7_POLSO = 0.0 
+        self.OFFSET_LATERALE_BRACCIO = 0.02 
+        self.OFFSET_J7_POLSO = 0.735
         self.OFFSET_DISTANZA_REACH = 0.0
         self.TARGET_WORLD_ANGLE = 1.57
         
-        # --- PARAMETRI ---
         self.L1 = 0.316
         self.L2 = 0.384
         self.OFFSET_SPALLA = 0.33
@@ -41,9 +37,12 @@ class RobotMover(Node):
         self.CENTER_X = 0.50
         self.CENTER_Y = 0.00
         
+        # Mappa per decodificare il colore
+        self.COLOR_MAP = {1.0: "ROSSO", 2.0: "VERDE", 3.0: "BLU"}
+        
         self.is_busy = False 
         self.muovi_braccio(self.HOME_POS, durata=5.0)
-        self.get_logger().info('ROBOT PRONTO. Reset Offset a 0 per test visione.')
+        self.get_logger().info('ROBOT PRONTO. Attendo target e colore...')
 
     def vision_callback(self, msg):
         if self.is_busy: return 
@@ -51,52 +50,69 @@ class RobotMover(Node):
         if math.sqrt(msg.x**2 + msg.y**2) > 0.85: return 
 
         self.is_busy = True
-        threading.Thread(target=self.esegui_missione, args=(msg.x, msg.y)).start()
+        # Passiamo anche msg.z (codice colore) al thread
+        threading.Thread(target=self.esegui_missione, args=(msg.x, msg.y, msg.z)).start()
 
-    def esegui_missione(self, target_x, target_y):
-        self.get_logger().info(f'--- MISSIONE: Target X={target_x:.3f}, Y={target_y:.3f} ---')
+    def esegui_missione(self, target_x, target_y, color_code):
+        # Decodifica Colore
+        nome_colore = self.COLOR_MAP.get(float(color_code), "SCONOSCIUTO")
         
-        # 1. Distanza planare
+        # 1. Calcoli Angolari
         distanza_totale = math.sqrt(target_x**2 + target_y**2)
+        theta_base_atan = math.atan2(target_y, target_x)
         
-        # 2. Angolo base geometrico
-        theta_base_geom = math.atan2(target_y, target_x)
-        
-        # 3. FORMULA CORREZIONE MECCANICA (Tangent offset)
-        # Calcola l'angolo per essere tangenti all'offset laterale del braccio
-        if abs(self.L_OFFSET_LATERALE) < distanza_totale:
-            delta_offset = math.asin(self.L_OFFSET_LATERALE / distanza_totale)
-            theta1 = theta_base_geom - delta_offset
-        else:
-            theta1 = theta_base_geom
+        try:
+            delta_correction = math.asin(self.OFFSET_LATERALE_BRACCIO / distanza_totale)
+        except ValueError:
+            delta_correction = 0.0 
+            
+        theta1_scelto = theta_base_atan - delta_correction
+        theta7_scelto = (self.TARGET_WORLD_ANGLE - theta1_scelto) + self.OFFSET_J7_POLSO
 
-        # 4. Angolo Polso Compensato
-        theta7 = (self.TARGET_WORLD_ANGLE - theta1) + self.OFFSET_J7_POLSO
-        
-        self.get_logger().info(f'Calcoli: J1={theta1:.3f} (Base={theta_base_geom:.3f})')
+        # --- FUNZIONE LOG PERSISTENTE ---
+        def log_status(fase):
+            print("\n" + "="*40)
+            print(f"  MISSIONE ATTIVA: {nome_colore}")   # <--- QUI MOSTRA IL COLORE
+            print("="*40)
+            print(f"  Target X : {target_x:.3f}")
+            print(f"  Target Y : {target_y:.3f}")
+            print("-" * 40)
+            print(f"  ANGOLO Base (Calc) : {math.degrees(theta_base_atan):.2f}°")
+            print(f"  CORREZIONE Offset  : {math.degrees(-delta_correction):.2f}°")
+            print(f"  -> ANGOLO SCELTO   : {math.degrees(theta1_scelto):.2f}°")
+            print("-" * 40)
+            print(f"  STATUS: {fase}")
+            print("="*40 + "\n")
 
-        # SEQUENZA MOVIMENTI
-        self.muovi_cinematica(target_x, target_y, self.Z_ALTA, theta1, theta7)
+        # --- ESECUZIONE ---
+        log_status("INIZIO - Calcolo Completato")
+        
+        self.muovi_cinematica(target_x, target_y, self.Z_ALTA, theta1_scelto, theta7_scelto)
+        log_status("Approccio Alto")
         time.sleep(4.0)
         
         self.muovi_pinza(0.04)
         time.sleep(1.0)
-        self.muovi_cinematica(target_x, target_y, self.Z_SICUREZZA, theta1, theta7)
+        self.muovi_cinematica(target_x, target_y, self.Z_SICUREZZA, theta1_scelto, theta7_scelto)
+        log_status("Discesa sul pezzo")
         time.sleep(3.0)
         
         self.muovi_pinza(0.01) 
         time.sleep(1.5)
-        
-        self.muovi_cinematica(target_x, target_y, self.Z_ALTA, theta1, theta7)
+        log_status("PRESA EFFETTUATA")
+
+        self.muovi_cinematica(target_x, target_y, self.Z_ALTA, theta1_scelto, theta7_scelto)
+        log_status("Sollevamento")
         time.sleep(3.0)
         
-        # PIAZZAMENTO
+        # Piazzamento
         dest_x = self.CENTER_X
         dest_y = self.CENTER_Y + 0.06
-        theta1_dest = math.atan2(dest_y, dest_x) # Qui niente offset laterale critico
+        theta1_dest = math.atan2(dest_y, dest_x)
         theta7_dest = (self.TARGET_WORLD_ANGLE - theta1_dest)
         
         self.muovi_cinematica(dest_x, dest_y, self.Z_ALTA, theta1_dest, theta7_dest)
+        log_status("Spostamento verso Centro")
         time.sleep(4.0)
         
         self.muovi_cinematica(dest_x, dest_y, 0.25, theta1_dest, theta7_dest)
@@ -106,9 +122,11 @@ class RobotMover(Node):
         time.sleep(1.5)
         
         self.muovi_braccio(self.HOME_POS, durata=4.0)
+        log_status("Ritorno in Home")
         time.sleep(4.0)
         
         self.is_busy = False 
+        print(f"\n[FINE MISSIONE {nome_colore}] Torno in attesa.\n")
 
     def muovi_cinematica(self, x, y, z, theta1_cmd, theta7_cmd):
         if z < self.Z_SICUREZZA: z = self.Z_SICUREZZA
@@ -127,7 +145,6 @@ class RobotMover(Node):
         theta2_robot = (math.pi / 2) - theta2_geom
 
         theta6 = -1.0 * (theta2_geom + theta4)
-        
         while theta7_cmd > 3.14: theta7_cmd -= 6.28
         while theta7_cmd < -3.14: theta7_cmd += 6.28
 
