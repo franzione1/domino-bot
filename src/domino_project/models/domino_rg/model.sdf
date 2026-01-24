@@ -5,7 +5,8 @@
     <link name="link">
       
       <inertial>
-        <mass>0.06</mass> <inertia>
+        <mass>0.001</mass> 
+        <inertia>
           <ixx>0.00001</ixx>
           <ixy>0</ixy>
           <ixz>0</ixz>

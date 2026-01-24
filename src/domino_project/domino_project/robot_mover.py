@@ -97,7 +97,7 @@ class RobotMover(Node):
         log_status("Discesa sul pezzo")
         time.sleep(3.0)
         
-        self.muovi_pinza(0.01) 
+        self.muovi_pinza(0.0265) # Chiusura pinza
         time.sleep(1.5)
         log_status("PRESA EFFETTUATA")
 
