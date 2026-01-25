@@ -56,7 +56,7 @@ class RobotMover(Node):
     def esegui_missione(self, target_x, target_y, color_code):
         # Decodifica Colore
         nome_colore = self.COLOR_MAP.get(float(color_code), "SCONOSCIUTO")
-        
+
         # 1. Calcoli Angolari
         distanza_totale = math.sqrt(target_x**2 + target_y**2)
         theta_base_atan = math.atan2(target_y, target_x)
@@ -97,7 +97,7 @@ class RobotMover(Node):
         log_status("Discesa sul pezzo")
         time.sleep(5.0)
         
-        self.muovi_pinza(0.015) # Chiusura pinza
+        self.muovi_pinza(0.025) # Chiusura pinza
         time.sleep(1.5)
         log_status("PRESA EFFETTUATA")
 
@@ -164,7 +164,7 @@ class RobotMover(Node):
     def muovi_pinza(self, apertura):
         goal = GripperCommand.Goal()
         goal.command.position = apertura
-        goal.command.max_effort = 10000.0
+        goal.command.max_effort = 2000.0
         if not self.gripper_client.wait_for_server(timeout_sec=1.0): return
         self.gripper_client.send_goal_async(goal)
 
