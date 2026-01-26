@@ -7,6 +7,7 @@ from geometry_msgs.msg import Point
 import math
 import time
 import threading
+from std_msgs.msg import Bool
 
 class RobotMover(Node):
     def __init__(self):
@@ -19,6 +20,9 @@ class RobotMover(Node):
         
         self.joint_names = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7']
         
+        # NUOVO PUBLISHER PER IL TRUCCO
+        self.vacuum_pub = self.create_publisher(Bool, '/panda_hand/grasping', 10)
+
         # --- TUNING ---
         self.HOME_POS = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
         
@@ -91,13 +95,13 @@ class RobotMover(Node):
         log_status("Approccio Alto")
         time.sleep(4.0)
         
-        self.muovi_pinza(0.04)
+        self.muovi_pinza(0.04, attiva_magnete=False) # Apertura pinza
         time.sleep(1.0)
         self.muovi_cinematica(target_x, target_y, self.Z_SICUREZZA, theta1_scelto, theta7_scelto)
         log_status("Discesa sul pezzo")
         time.sleep(5.0)
         
-        self.muovi_pinza(0.025) # Chiusura pinza
+        self.muovi_pinza(0.027, attiva_magnete=True) # Chiusura pinza
         time.sleep(1.5)
         log_status("PRESA EFFETTUATA")
 
@@ -118,7 +122,7 @@ class RobotMover(Node):
         self.muovi_cinematica(dest_x, dest_y, 0.25, theta1_dest, theta7_dest)
         time.sleep(3.0)
         
-        self.muovi_pinza(0.04)
+        self.muovi_pinza(0.04, attiva_magnete=False) # Apertura pinza
         time.sleep(1.5)
         
         self.muovi_braccio(self.HOME_POS, durata=4.0)
@@ -161,12 +165,24 @@ class RobotMover(Node):
         msg.points.append(point)
         self.arm_publisher.publish(msg)
 
-    def muovi_pinza(self, apertura):
+    def muovi_pinza(self, apertura, attiva_magnete=False):
+        # 1. GESTIONE MAGNETE
+        # Pubblichiamo subito lo stato del magnete (True = Presa Incollata, False = Rilascio)
+        msg_vac = Bool()
+        msg_vac.data = attiva_magnete
+        self.vacuum_pub.publish(msg_vac)
+
+        # 2. MOVIMENTO FISICO DITA (Scenografia)
+        # Usiamo l'Action Client come hai configurato nel tuo __init__
         goal = GripperCommand.Goal()
         goal.command.position = apertura
-        goal.command.max_effort = 2000.0
-        if not self.gripper_client.wait_for_server(timeout_sec=1.0): return
-        self.gripper_client.send_goal_async(goal)
+        goal.command.max_effort = 1000.0  # Forza alta per assicurarsi che si muova
+        
+        # Inviamo il comando alle dita
+        if self.gripper_client.wait_for_server(timeout_sec=1.0):
+            self.gripper_client.send_goal_async(goal)
+        else:
+            self.get_logger().warn("Gripper Action Server non disponibile!")
 
 def main(args=None):
     rclpy.init(args=args)

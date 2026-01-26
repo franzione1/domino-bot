@@ -4,7 +4,7 @@
     <static>false</static>
     <link name="link">
       <inertial>
-        <mass>0.05</mass> 
+        <mass>0.001</mass> 
       </inertial>
       <collision name="collision">
         <geometry>
