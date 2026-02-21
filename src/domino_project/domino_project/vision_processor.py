@@ -4,6 +4,8 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Point
+from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import Header
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
@@ -13,16 +15,20 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 class SmartDominoVision(Node):
     def __init__(self):
         super().__init__('smart_domino_vision')
-        
         # --- CALIBRAZIONE CAM ---
-        self.CAMERA_X = 0.7      
-        self.CAMERA_Y = 0.0      
-        self.IMG_CENTER_X = 400  
-        self.IMG_CENTER_Y = 400  
-        
-        # La scala non cambia (dipende dall'altezza della cam, non dalla grandezza dei pezzi)
-        self.SCALE_X = -0.0020  
-        self.SCALE_Y = -0.0020  
+        # read calibration from parameters (can be overridden via params.yaml)
+        self.declare_parameter('camera.cam_x', 0.7)
+        self.declare_parameter('camera.cam_y', 0.0)
+        self.declare_parameter('camera.img_center_x', 400)
+        self.declare_parameter('camera.img_center_y', 400)
+        self.declare_parameter('camera.scale_x', -0.0020)
+        self.declare_parameter('camera.scale_y', -0.0020)
+        self.CAMERA_X = self.get_parameter('camera.cam_x').get_parameter_value().double_value
+        self.CAMERA_Y = self.get_parameter('camera.cam_y').get_parameter_value().double_value
+        self.IMG_CENTER_X = int(self.get_parameter('camera.img_center_x').get_parameter_value().integer_value)
+        self.IMG_CENTER_Y = int(self.get_parameter('camera.img_center_y').get_parameter_value().integer_value)
+        self.SCALE_X = self.get_parameter('camera.scale_x').get_parameter_value().double_value
+        self.SCALE_Y = self.get_parameter('camera.scale_y').get_parameter_value().double_value
 
         # --- COLORI & CODICI ---
         self.COLORS = {
@@ -44,6 +50,7 @@ class SmartDominoVision(Node):
         qos_policy = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
         self.subscription = self.create_subscription(Image, '/table_camera/image_raw', self.image_callback, qos_profile=qos_policy)
         self.coord_pub = self.create_publisher(Point, '/domino_position', 10)
+        self.detections_pub = self.create_publisher(MarkerArray, '/domino_detections', 10)
         
         self.bridge = CvBridge()
         self.last_print_time = 0
@@ -108,6 +115,40 @@ class SmartDominoVision(Node):
             p.y = target_blob['ry']
             p.z = self.COLOR_CODES.get(target_blob['colore'], 0.0) 
             self.coord_pub.publish(p)
+
+            # Also publish a semantic MarkerArray with label, approximate bounding pose and a confidence score
+            marker = Marker()
+            marker.header = Header()
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.header.frame_id = 'world'
+            marker.ns = 'domino_detections'
+            marker.id = 0
+            marker.type = Marker.CUBE
+            marker.action = Marker.ADD
+            marker.pose.position.x = p.x
+            marker.pose.position.y = p.y
+            marker.pose.position.z = 1.32
+            marker.pose.orientation.w = 1.0
+            # bounding box scales (approx)
+            marker.scale.x = 0.06; marker.scale.y = 0.02; marker.scale.z = 0.02
+            # color by semantic
+            col = {'ROSSO': (1.0,0.0,0.0), 'BLU': (0.0,0.0,1.0), 'VERDE': (0.0,1.0,0.0)}.get(target_blob['colore'], (1.0,1.0,1.0))
+            marker.color.r = col[0]; marker.color.g = col[1]; marker.color.b = col[2]; marker.color.a = 0.9
+            text = Marker()
+            text.header = marker.header
+            text.ns = 'domino_labels'
+            text.id = 1
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+            text.pose = marker.pose
+            text.pose.position.z += 0.05
+            text.scale.z = 0.05
+            text.color.r = 1.0; text.color.g = 1.0; text.color.b = 1.0; text.color.a = 1.0
+            text.text = f"{target_blob['colore']}:{round(1.0,2)}"
+            ma = MarkerArray()
+            ma.markers.append(marker)
+            ma.markers.append(text)
+            self.detections_pub.publish(ma)
             
             now = self.get_clock().now().nanoseconds / 1e9
             if now - self.last_print_time > 2.0:

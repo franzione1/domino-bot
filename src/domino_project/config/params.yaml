@@ -1,0 +1,21 @@
+domino:
+  size: [0.06, 0.02, 0.02]
+  spawn_z: 1.32
+approach:
+  z_high: 0.35
+  z_pick: 0.235
+  drop_x: 0.50
+  drop_y: 0.00
+vision:
+  hsv_lower: [0.0, 0.3, 0.3]
+  hsv_upper: [1.0, 1.0, 1.0]
+camera:
+  cam_x: 0.7
+  cam_y: 0.0
+  img_center_x: 400
+  img_center_y: 400
+  scale_x: -0.0020
+  scale_y: -0.0020
+planner:
+  max_velocity_scaling: 0.4
+  max_acceleration_scaling: 0.4
