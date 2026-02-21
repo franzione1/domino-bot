@@ -327,13 +327,16 @@ def generate_launch_description():
         # Start RViz a bit after move_group if available
         TimerAction(period=6.0, actions=[rviz_node] if rviz_node is not None else []),
 
-        TimerAction(period=5.0, actions=[spawn_table]),
-        TimerAction(period=6.0, actions=[spawn_camera]),
-        TimerAction(period=8.0, actions=[spawn_domino1, spawn_domino2, spawn_domino3]),
+        # Spawna gli oggetti solo dopo che Gazebo è stabile
+        TimerAction(period=10.0, actions=[spawn_table]),
+        TimerAction(period=12.0, actions=[spawn_camera]),
+        TimerAction(period=14.0, actions=[spawn_domino1, spawn_domino2, spawn_domino3]),
 
-        TimerAction(period=4.0, actions=[joint_state_broadcaster, panda_arm_controller]),
-        TimerAction(period=8.0, actions=[panda_hand_controller]),
+        # Ritarda i controller per evitare il timeout
+        TimerAction(period=16.0, actions=[joint_state_broadcaster, panda_arm_controller]),
+        TimerAction(period=18.0, actions=[panda_hand_controller]),
 
-        # Avviamo il cervello C++ solo dopo che tutto è pronto
-        TimerAction(period=12.0, actions=[robot_mover_node, vision_node, vision_test_publisher]),
+        # Avvia l'intelligenza artificiale e MoveIt alla fine
+        TimerAction(period=25.0, actions=[robot_mover_node, vision_node, vision_test_publisher]),
+        
     ])

@@ -37,6 +37,7 @@ install(TARGETS
 # --- SCRIPT PYTHON (Visione) ---
 install(PROGRAMS
   domino_project/vision_processor.py
+  domino_project/vision_test_publisher.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -8,7 +8,7 @@ source /home/ros/ros2_domino_ws/install/setup.bash || true
 
 ros2 launch domino_project final_system_moveit.launch.py &
 LAUNCH_PID=$!
-sleep 10
+sleep 20
 # Publish a test Point to /domino_position
 python3 - <<'PY'
 import rclpy
