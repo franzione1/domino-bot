@@ -95,21 +95,25 @@ private:
   void add_scene_collision_objects()
   {
     std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
+    
+    // 1. Tavolo virtuale reso microscopico e sepolto a -1 metro!
     moveit_msgs::msg::CollisionObject table;
     table.id = "work_table";
     table.header.frame_id = "world";
     shape_msgs::msg::SolidPrimitive table_prim;
     table_prim.type = shape_msgs::msg::SolidPrimitive::BOX;
-    table_prim.dimensions = {1.2, 1.2, 0.05};
+    table_prim.dimensions = {0.001, 0.001, 0.001}; // Microscopico
     geometry_msgs::msg::Pose table_pose;
+    table_pose.position.x = 0.6; 
     table_pose.position.y = 0.0;
-    table_pose.position.z = 0.8 - 0.025; 
+    table_pose.position.z = -1.0; // Sotto terra (nessuna collisione con il braccio)
     table_pose.orientation.w = 1.0;
     table.primitives.push_back(table_prim);
     table.primitive_poses.push_back(table_pose);
     table.operation = table.ADD;
     collision_objects.push_back(table);
 
+    // 2. Domino virtuali resi microscopici e sepolti a -0.5 metri
     std::vector<std::pair<std::string, std::pair<double,double>>> dominos = {
       {"domino_rg", {0.5, 0.0}}, {"domino_gb", {0.5, 0.2}}, {"domino_br", {0.5, -0.2}}
     };
@@ -119,9 +123,11 @@ private:
       obj.header.frame_id = "world";
       shape_msgs::msg::SolidPrimitive prim;
       prim.type = shape_msgs::msg::SolidPrimitive::BOX;
-      prim.dimensions = {0.06, 0.03, 0.02};
+      prim.dimensions = {0.001, 0.001, 0.001}; // Microscopico
       geometry_msgs::msg::Pose p;
-      p.position.x = d.second.first; p.position.y = d.second.second; p.position.z = 1.32; 
+      p.position.x = d.second.first; 
+      p.position.y = d.second.second; 
+      p.position.z = -0.5; // Sotto terra, ma MoveIt può ancora leggere le loro X e Y!
       p.orientation.w = 1.0;
       obj.primitives.push_back(prim);
       obj.primitive_poses.push_back(p);
@@ -130,7 +136,7 @@ private:
     }
     planning_scene_interface_->applyCollisionObjects(collision_objects);
   }
-
+  
   std::string find_closest_domino(double x, double y)
   {
       std::vector<std::string> ids = {"domino_rg", "domino_gb", "domino_br"};
@@ -303,7 +309,8 @@ private:
     std::vector<geometry_msgs::msg::Pose> waypoints = {target_pose};
     moveit_msgs::msg::RobotTrajectory trajectory;
     
-    double fraction = move_group_->computeCartesianPath(waypoints, 0.01, 0.0, trajectory);
+    // avoid_collisions = false (L'ultimo parametro)
+    double fraction = move_group_->computeCartesianPath(waypoints, 0.01, 0.0, trajectory, false);
     
     if (fraction > 0.9) {
       moveit::planning_interface::MoveGroupInterface::Plan plan;
