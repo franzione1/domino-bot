@@ -12,7 +12,6 @@ def generate_launch_description():
     my_pkg = get_package_share_directory('domino_project')
     
     # --- 1. CONFIGURAZIONE MOVEIT (URDF + SRDF) ---
-    # Robustly locate URDF and SRDF across likely packages and fall back to local files.
     urdf_path = None
     srdf_path = None
     candidate_pkgs = [
@@ -37,8 +36,6 @@ def generate_launch_description():
         if urdf_path and srdf_path:
             break
 
-
-    # Search for XACRO in any candidate package (prefer xacro over raw URDF)
     xacro_path = None
     for pkg_name in candidate_pkgs:
         try:
@@ -54,23 +51,16 @@ def generate_launch_description():
             break
 
     if urdf_path is None and xacro_path is None:
-        raise FileNotFoundError('Could not find panda.urdf or panda.urdf.xacro in any candidate package. Searched: ' + ','.join(candidate_pkgs))
+        raise FileNotFoundError('Could not find panda.urdf or panda.urdf.xacro in any candidate package.')
 
-    # Read SRDF if available (optional)
     if srdf_path is None:
         robot_desc_semantic = ''
     else:
         with open(srdf_path, 'r') as f:
             robot_desc_semantic = f.read()
 
-    # --- T02: Ensure SRDF virtual_joint child matches URDF root ---
-    # Determine URDF root link by parsing joints (child links) and finding a link
-    # that is not a child of any joint (the root). If SRDF's virtual_joint child
-    # does not match, update the SRDF string in-memory so MoveIt sees a matching
-    # virtual_joint.
     try:
         import xml.etree.ElementTree as ET
-        # find URDF root link
         urdf_root = None
         try:
             urdf_xml = ET.fromstring(robot_desc)
@@ -78,7 +68,6 @@ def generate_launch_description():
             child_links = {j.find('child').attrib['link'] for j in urdf_xml.findall('joint') if j.find('child') is not None}
             candidates = links - child_links
             if candidates:
-                # pick one candidate (there should be one root)
                 urdf_root = sorted(list(candidates))[0]
         except Exception:
             urdf_root = None
@@ -90,24 +79,18 @@ def generate_launch_description():
                 if vj is not None:
                     child = vj.attrib.get('child_link') or vj.attrib.get('child')
                     if child and child != urdf_root:
-                        # replace attribute name whichever exists
                         if 'child_link' in vj.attrib:
                             vj.attrib['child_link'] = urdf_root
                         else:
                             vj.attrib['child'] = urdf_root
-                        # write back to string
                         robot_desc_semantic = ET.tostring(srdf_xml, encoding='unicode')
             except Exception:
-                # if parsing fails, leave SRDF untouched
                 pass
     except Exception:
         pass
 
-    # Prefer generating URDF from XACRO (so we can set non-interactive args);
-    # otherwise read URDF file directly.
     if xacro_path is not None:
         doc = xacro.parse(open(xacro_path))
-        # Use pedestal layout by default: cell_layout_2 = true (select option 2)
         xacro.process_doc(doc, mappings={
             'cell_layout_1': 'false',
             'cell_layout_2': 'true',
@@ -126,8 +109,6 @@ def generate_launch_description():
     camera_sdf = os.path.join(my_pkg, 'models', 'camera_sensor', 'model.sdf')
 
     # --- 3. NODI ---
-    
-    # Gazebo (non-interactive): include generic gazebo launch with specific world
     panda_world = os.path.join(panda_pkg, 'worlds', 'panda.world')
     gazebo_launch_pkg = get_package_share_directory('gazebo_ros')
     gazebo = IncludeLaunchDescription(
@@ -135,7 +116,6 @@ def generate_launch_description():
         launch_arguments={'world': panda_world}.items(),
     )
 
-    # Static TF and robot_state_publisher so `robot_description` is available
     static_tf = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
@@ -152,25 +132,12 @@ def generate_launch_description():
         parameters=[{'robot_description': robot_desc}],
     )
 
-    # Spawn the robot from the `robot_description` topic (non-interactive)
     spawn_robot = Node(
         package='gazebo_ros',
         executable='spawn_entity.py',
         arguments=['-topic', 'robot_description', '-entity', 'panda'],
         output='screen'
     )
-
-    # Helper to load files from packages
-    def load_file(package_name, file_path):
-        try:
-            pkg_path = get_package_share_directory(package_name)
-        except Exception:
-            return None
-        abs_path = os.path.join(pkg_path, file_path)
-        if not os.path.exists(abs_path):
-            return None
-        with open(abs_path, 'r') as f:
-            return f.read()
 
     def load_yaml(package_name, file_path):
         try:
@@ -183,21 +150,14 @@ def generate_launch_description():
         with open(abs_path, 'r') as f:
             return yaml.safe_load(f)
 
-    # Load MoveIt configs from panda_ros2_moveit2 when available
-    moveit_pkg = None
-    try:
-        moveit_pkg = get_package_share_directory('panda_ros2_moveit2')
-    except Exception:
-        moveit_pkg = None
-
-    # Prepare parameters similar to the panda launch
     robot_description = {'robot_description': robot_desc}
     robot_description_semantic = {'robot_description_semantic': robot_desc_semantic} if robot_desc_semantic else {}
 
-    # Kinematics
-    kinematics_yaml = load_yaml('panda_ros2_moveit2', 'config/kinematics.yaml') or {}
+    # --- FIX CINEMATICA (KDL POTENZIATO) ---
+    kinematics_yaml = load_yaml('domino_project', 'config/kinematics.yaml')
+    if not kinematics_yaml:
+        kinematics_yaml = load_yaml('panda_ros2_moveit2', 'config/kinematics.yaml') or {}
 
-    # OMPL planning pipeline
     ompl_planning_pipeline_config = {
         'move_group': {
             'planning_plugin': 'ompl_interface/OMPLPlanner',
@@ -209,13 +169,10 @@ def generate_launch_description():
     if ompl_from_pkg:
         ompl_planning_pipeline_config['move_group'].update(ompl_from_pkg)
 
-    # Also allow local tuning overrides in this package
     ompl_local = load_yaml('domino_project', 'config/ompl_tuning.yaml')
     if ompl_local:
         ompl_planning_pipeline_config['move_group'].update(ompl_local)
 
-    # Controllers
-    # Controllers espliciti (Bypassiamo i file YAML per evitare errori in Foxy)
     moveit_controllers = {
         'moveit_controller_manager': 'moveit_simple_controller_manager/MoveItSimpleControllerManager',
         'moveit_simple_controller_manager': {
@@ -254,7 +211,6 @@ def generate_launch_description():
         'publish_transforms_updates': True,
     }
 
-    # MoveIt MoveGroup (Il Server) - launch move_group directly with robot descriptions and configs
     move_group = Node(
         package='moveit_ros_move_group',
         executable='move_group',
@@ -270,12 +226,12 @@ def generate_launch_description():
             {'use_sim_time': True},
         ],
     )
-    # RViz (MoveIt configuration) - use panda_moveit2 rviz config when available
+
     try:
         rviz_config = os.path.join(get_package_share_directory('panda_ros2_moveit2'), 'config', 'panda_moveit2.rviz')
     except Exception:
         rviz_config = None
-    # Fallback to package RViz config if the panda config isn't available
+        
     if not rviz_config or not os.path.exists(rviz_config):
         candidate = os.path.join(my_pkg, 'config', 'domino_moveit.rviz')
         if os.path.exists(candidate):
@@ -292,8 +248,6 @@ def generate_launch_description():
             parameters=[robot_description, robot_description_semantic, ompl_planning_pipeline_config, kinematics_yaml],
         )
     
-    # IL TUO NODO C++ (Il Client)
-    # Qui passiamo i parametri robot_description necessari!
     robot_mover_node = Node(
         package='domino_project',
         executable='robot_mover_cpp', 
@@ -304,14 +258,12 @@ def generate_launch_description():
         }, os.path.join(my_pkg, 'config', 'params.yaml')]
     )
     
-    # Visione Python
     vision_node = Node(
         package='domino_project',
         executable='vision_processor.py', 
         output='screen'
     )
 
-    # Test publisher for vision detections (used for automatic testing)
     vision_test_publisher = Node(
         package='domino_project',
         executable='vision_test_publisher.py',
@@ -319,7 +271,6 @@ def generate_launch_description():
         output='screen'
     )
 
-    # Spawners (Oggetti)
     spawn_table = Node(package='gazebo_ros', executable='spawn_entity.py',
         arguments=['-entity', 'work_table', '-file', table_sdf, '-x', '0.7', '-y', '0.0', '-z', '0.8'], output='screen')
     
@@ -331,30 +282,19 @@ def generate_launch_description():
     spawn_domino2 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_gb', '-file', domino_gb, '-x', '0.5', '-y', '0.2', '-z', z_height], output='screen')
     spawn_domino3 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_br', '-file', domino_br, '-x', '0.5', '-y', '-0.2', '-z', z_height], output='screen')
     
-    # Controllers
     joint_state_broadcaster = Node(package="controller_manager", executable="spawner.py", arguments=["joint_state_broadcaster"])
     panda_arm_controller = Node(package="controller_manager", executable="spawner.py", arguments=["panda_arm_controller"])
     panda_hand_controller = Node(package="controller_manager", executable="spawner.py", arguments=["panda_hand_controller"])
 
     return LaunchDescription([
         gazebo,
-
-        # 1. Base robot
         TimerAction(period=1.0, actions=[static_tf, robot_state_publisher, spawn_robot]),
-
-        # 2. Spawna oggetti in Gazebo
         TimerAction(period=8.0, actions=[spawn_table]),
         TimerAction(period=10.0, actions=[spawn_camera]),
         TimerAction(period=12.0, actions=[spawn_domino1, spawn_domino2, spawn_domino3]),
-
-        # 3. Avvia i controller di Gazebo SOLO a 25 secondi (Diamo tempo a Gazebo di caricarsi)
         TimerAction(period=25.0, actions=[joint_state_broadcaster, panda_arm_controller]),
         TimerAction(period=28.0, actions=[panda_hand_controller]),
-
-        # 4. FONDAMENTALE: MoveIt a 40 secondi, così i controller sono sicuramente attivi
         TimerAction(period=40.0, actions=[move_group]),
-        
-        # 5. RViz e l'Intelligenza a 50 secondi
         TimerAction(period=45.0, actions=[rviz_node] if rviz_node is not None else []),
         TimerAction(period=50.0, actions=[robot_mover_node, vision_node, vision_test_publisher]),
     ])

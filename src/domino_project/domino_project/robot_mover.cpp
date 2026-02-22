@@ -12,10 +12,8 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <fstream>
 
-const double Z_ALTA_DEFAULT = 0.35;
-const double Z_PRESA_DEFAULT = 0.235;
-const double DROP_X_DEFAULT = 0.50;
-const double DROP_Y_DEFAULT = 0.00;
+const double Z_ALTA_DEFAULT = 1.50;
+const double Z_PRESA_DEFAULT = 1.325;
 
 class RobotMover : public rclcpp::Node
 {
@@ -39,9 +37,6 @@ public:
     this->declare_parameter<double>("planner.max_acceleration_scaling", 0.4);
     planner_max_velocity_ = this->get_parameter("planner.max_velocity_scaling").as_double();
     planner_max_acceleration_ = this->get_parameter("planner.max_acceleration_scaling").as_double();
-    
-    this->declare_parameter<int>("runtime.max_retries", 3);
-    max_retries_ = this->get_parameter("runtime.max_retries").as_int();
 
     metrics_file_.open("/tmp/domino_metrics.csv", std::ios::app);
     if (metrics_file_.tellp() == 0) {
@@ -52,7 +47,6 @@ public:
   void setup_moveit()
   {
     try {
-      // Usa lo shared_ptr nativo del nodo ROS 2
       auto node_ptr = this->shared_from_this();
       move_group_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(node_ptr, "panda_arm");
       hand_group_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(node_ptr, "hand");
@@ -63,8 +57,10 @@ public:
     
     move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
     move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
-    move_group_->setPlanningTime(1.5);
-    move_group_->setNumPlanningAttempts(3);
+    move_group_->setPlanningTime(5.0);
+    move_group_->setNumPlanningAttempts(10);
+    move_group_->setGoalPositionTolerance(0.01);
+    move_group_->setGoalOrientationTolerance(0.1);
 
     planning_scene_interface_ = std::make_shared<moveit::planning_interface::PlanningSceneInterface>();
     add_scene_collision_objects();
@@ -83,7 +79,6 @@ private:
   
   double z_alta_, z_presa_;
   double planner_max_velocity_, planner_max_acceleration_;
-  int failure_count_ = 0, max_retries_ = 3, last_target_color_code_ = 0;
   bool simulate_gripper_ = true, is_busy_ = false;
   std::atomic_bool moveit_ready_{false};
   std::vector<visualization_msgs::msg::Marker> latest_markers_;
@@ -96,24 +91,24 @@ private:
   {
     std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
     
-    // 1. Tavolo virtuale reso microscopico e sepolto a -1 metro!
+    // 1. Tavolo virtuale ribassato (per far scendere le dita senza allarmi)
     moveit_msgs::msg::CollisionObject table;
     table.id = "work_table";
     table.header.frame_id = "world";
     shape_msgs::msg::SolidPrimitive table_prim;
     table_prim.type = shape_msgs::msg::SolidPrimitive::BOX;
-    table_prim.dimensions = {0.001, 0.001, 0.001}; // Microscopico
+    table_prim.dimensions = {0.8, 1.2, 0.5}; // Spessore ridotto
     geometry_msgs::msg::Pose table_pose;
-    table_pose.position.x = 0.6; 
+    table_pose.position.x = 0.7; 
     table_pose.position.y = 0.0;
-    table_pose.position.z = -1.0; // Sotto terra (nessuna collisione con il braccio)
+    table_pose.position.z = 0.80; // La cima virtuale del tavolo ora è a Z=1.05
     table_pose.orientation.w = 1.0;
     table.primitives.push_back(table_prim);
     table.primitive_poses.push_back(table_pose);
     table.operation = table.ADD;
     collision_objects.push_back(table);
 
-    // 2. Domino virtuali resi microscopici e sepolti a -0.5 metri
+    // 2. Domino virtuali
     std::vector<std::pair<std::string, std::pair<double,double>>> dominos = {
       {"domino_rg", {0.5, 0.0}}, {"domino_gb", {0.5, 0.2}}, {"domino_br", {0.5, -0.2}}
     };
@@ -123,11 +118,11 @@ private:
       obj.header.frame_id = "world";
       shape_msgs::msg::SolidPrimitive prim;
       prim.type = shape_msgs::msg::SolidPrimitive::BOX;
-      prim.dimensions = {0.001, 0.001, 0.001}; // Microscopico
+      prim.dimensions = {0.02, 0.01, 0.01}; 
       geometry_msgs::msg::Pose p;
       p.position.x = d.second.first; 
       p.position.y = d.second.second; 
-      p.position.z = -0.5; // Sotto terra, ma MoveIt può ancora leggere le loro X e Y!
+      p.position.z = 1.32; 
       p.orientation.w = 1.0;
       obj.primitives.push_back(prim);
       obj.primitive_poses.push_back(p);
@@ -143,16 +138,12 @@ private:
       auto objects = planning_scene_interface_->getObjects(ids);
       std::string best_id = "";
       double min_dist = 0.15; 
-
       for (const auto& kv : objects) {
           if (!kv.second.primitive_poses.empty()) {
               double ox = kv.second.primitive_poses[0].position.x;
               double oy = kv.second.primitive_poses[0].position.y;
               double dist = std::sqrt(std::pow(ox - x, 2) + std::pow(oy - y, 2));
-              if (dist < min_dist) {
-                  min_dist = dist;
-                  best_id = kv.first;
-              }
+              if (dist < min_dist) { min_dist = dist; best_id = kv.first; }
           }
       }
       return best_id;
@@ -160,7 +151,6 @@ private:
 
   void vision_callback(const geometry_msgs::msg::Pose::SharedPtr msg)
   {
-    try { last_target_color_code_ = static_cast<int>(msg->position.z); } catch(...) { last_target_color_code_ = 0; }
     if (!moveit_ready_ || is_busy_ || (msg->position.x == 0.0 && msg->position.y == 0.0)) return;
     if (std::sqrt(std::pow(msg->position.x, 2) + std::pow(msg->position.y, 2)) > 0.8) return;
 
@@ -178,31 +168,14 @@ private:
     }).detach();
   }
 
-  // NUOVA FUNZIONE: LOGICA DEL GIOCO DEL DOMINO
   void calcola_posa_rilascio(double pick_y, double &drop_x, double &drop_y, double &drop_yaw)
   {
-      // Sappiamo che il domino centrale (Rosso-Verde) è a X=0.50, Y=0.0
-      // La metà Rossa è a sinistra (X minore), la metà Verde è a destra (X maggiore).
-
       if (pick_y > 0.1) {
-          // Abbiamo preso il pezzo a Y=0.2, ovvero il domino_gb (Verde-Blu).
-          // Deve collegarsi alla metà Verde del pezzo centrale (a destra).
-          drop_x = 0.565;  // 0.50 (centro) + 0.06 (lunghezza pezzo) + 0.005 gap di sicurezza
-          drop_y = 0.0;
-          drop_yaw = 0.0;  // Lo allineiamo orizzontalmente
-          RCLCPP_INFO(this->get_logger(), "LOGICA GIOCO: Collegamento VERDE-VERDE a destra.");
+          drop_x = 0.565; drop_y = 0.0; drop_yaw = 0.0;  
       } else if (pick_y < -0.1) {
-          // Abbiamo preso il pezzo a Y=-0.2, ovvero il domino_br (Blu-Rosso).
-          // Deve collegarsi alla metà Rossa del pezzo centrale (a sinistra).
-          drop_x = 0.435;  // 0.50 (centro) - 0.06 (lunghezza pezzo) - 0.005 gap di sicurezza
-          drop_y = 0.0;
-          drop_yaw = 0.0;  // Lo allineiamo orizzontalmente
-          RCLCPP_INFO(this->get_logger(), "LOGICA GIOCO: Collegamento ROSSO-ROSSO a sinistra.");
+          drop_x = 0.435; drop_y = 0.0; drop_yaw = 0.0;  
       } else {
-          // Fallback di sicurezza se non rientra nei parametri attesi
-          drop_x = 0.50;
-          drop_y = -0.15;
-          drop_yaw = 0.0;
+          drop_x = 0.50; drop_y = -0.15; drop_yaw = 0.0;
       }
   }
 
@@ -214,38 +187,35 @@ private:
     muovi_pinza("open");
     
     if (try_grasp_candidates(x, y, target_yaw, chosen_x, chosen_y, chosen_yaw)) {
-      log_metric("grasp_attempt", true, "Grasp Success");
       grasped = true;
     } else {
-      log_metric("grasp_attempt", false, "All candidates failed");
+      emergency_stop_and_recover();
       return;
     }
 
     if (grasped) {
-      // 1. Solleva il pezzo
-      if (!compute_cartesian_and_execute(chosen_x, chosen_y, z_alta_, chosen_yaw)) 
-          plan_and_execute_pose(chosen_x, chosen_y, z_alta_, chosen_yaw);
+      if (!compute_cartesian_and_execute(chosen_x, chosen_y, z_alta_, chosen_yaw)) {
+          emergency_stop_and_recover(); return;
+      }
       
-      // 2. Calcola dove metterlo usando le regole del Domino!
       double target_drop_x, target_drop_y, target_drop_yaw;
       calcola_posa_rilascio(chosen_y, target_drop_x, target_drop_y, target_drop_yaw);
       
-      // 3. Muovi sopra il punto di rilascio con il nuovo orientamento
-      if (!plan_and_execute_pose(target_drop_x, target_drop_y, z_alta_, target_drop_yaw)) 
-          emergency_stop_and_recover();
+      if (!plan_and_execute_pose(target_drop_x, target_drop_y, z_alta_, target_drop_yaw)) {
+          emergency_stop_and_recover(); return;
+      }
 
-      // 4. Abbassa per posizionare il pezzo vicino all'altro
-      compute_cartesian_and_execute(target_drop_x, target_drop_y, z_presa_ + 0.05, target_drop_yaw);
+      if (!compute_cartesian_and_execute(target_drop_x, target_drop_y, z_presa_ + 0.05, target_drop_yaw)) {
+          emergency_stop_and_recover(); return;
+      }
       
       muovi_pinza("open");
       
       if (!attached_object_id_.empty()) {
-          try { 
-              move_group_->detachObject(attached_object_id_); 
-              attached_object_id_ = "";
-          } catch (...) {}
+          try { move_group_->detachObject(attached_object_id_); attached_object_id_ = ""; } catch (...) {}
       }
       
+      compute_cartesian_and_execute(target_drop_x, target_drop_y, z_alta_, target_drop_yaw);
       go_to_home();
     }
   }
@@ -253,9 +223,6 @@ private:
   bool try_grasp_candidates(double x, double y, double target_yaw, double &out_x, double &out_y, double &out_yaw)
   {
     std::vector<double> lateral = {0.0, -0.01, 0.01};
-    
-    // TRUCCO SIMMETRIA: Aggiungiamo target_yaw + 3.14159 (+180 gradi). 
-    // Se a -90° il polso si spezza, a +90° la mossa sarà fluidissima!
     std::vector<double> yaws = {target_yaw, target_yaw + 3.14159, target_yaw - 3.14159, target_yaw - 0.1, target_yaw + 0.1};
 
     for (double dx : lateral) {
@@ -266,7 +233,14 @@ private:
           RCLCPP_INFO(this->get_logger(), ">>> TENTATIVO OMPL -> X:%.2f Y:%.2f Yaw:%.2f", tx, ty, yaw);
           
           if (!plan_and_execute_pose(tx, ty, z_alta_, yaw)) {
-              continue; // Fallisce velocemente (1.5s) e prova subito l'angolo successivo!
+              continue; 
+          }
+
+          // FIX COLLISIONI: Troviamo il domino e "nascondiamolo" alla vista di MoveIt
+          // così la pinza può scendere e toccarlo senza innescare l'allarme crash.
+          std::string target_obj = find_closest_domino(tx, ty);
+          if (!target_obj.empty()) {
+              planning_scene_interface_->removeCollisionObjects({target_obj});
           }
           
           RCLCPP_INFO(this->get_logger(), ">>> FASE 2: Discesa...");
@@ -275,22 +249,33 @@ private:
           }
           
           muovi_pinza("close");
-          rclcpp::sleep_for(std::chrono::milliseconds(500));
+          rclcpp::sleep_for(std::chrono::milliseconds(500)); // Tempo per chiudere le dita
 
-          std::string target_obj = find_closest_domino(tx, ty);
           if (!target_obj.empty()) {
-              move_group_->attachObject(target_obj, "panda_hand");
+              // Ora che lo abbiamo stretto, ricreiamolo dichiarandolo parte integrante della "mano"
+              moveit_msgs::msg::CollisionObject obj;
+              obj.id = target_obj;
+              obj.header.frame_id = "panda_hand"; // Coordinate riferite alla mano
+              shape_msgs::msg::SolidPrimitive prim;
+              prim.type = shape_msgs::msg::SolidPrimitive::BOX;
+              prim.dimensions = {0.06, 0.03, 0.02}; // Dimensioni reali
+              geometry_msgs::msg::Pose p;
+              p.position.z = 0.05; // Lo spingiamo 5cm nel palmo della pinza
+              p.orientation.w = 1.0;
+              obj.primitives.push_back(prim);
+              obj.primitive_poses.push_back(p);
+              obj.operation = obj.ADD;
+
+              planning_scene_interface_->applyCollisionObjects({obj});
+              
+              // FIX COLLISIONE INTERNA: Autorizziamo il contatto con le dita!
+              std::vector<std::string> touch_links = {"panda_hand", "panda_leftfinger", "panda_rightfinger"};
+              move_group_->attachObject(target_obj, "panda_hand", touch_links);
+              
               attached_object_id_ = target_obj;
-              out_x = tx; out_y = ty; out_yaw = yaw;
-              return true;
-          } else if (simulate_gripper_) {
-              out_x = tx; out_y = ty; out_yaw = yaw;
-              return true; 
           }
-          
-          muovi_pinza("open");
-          rclcpp::sleep_for(std::chrono::milliseconds(200));
-          compute_cartesian_and_execute(tx, ty, z_alta_, yaw);
+          out_x = tx; out_y = ty; out_yaw = yaw;
+          return true;
         }
     }
     return false;
@@ -298,29 +283,29 @@ private:
 
   bool compute_cartesian_and_execute(double x, double y, double z, double yaw)
   {
+    // FIX FISICO: Diamo 400ms ai motori per stabilizzare l'inerzia del braccio
+    rclcpp::sleep_for(std::chrono::milliseconds(400));
+    // Diciamo a MoveIt di rileggere i sensori per sapere la sua esatta posizione reale
+    move_group_->setStartStateToCurrentState();
+
     geometry_msgs::msg::Pose target_pose;
     target_pose.position.x = x; target_pose.position.y = y; target_pose.position.z = z;
     
     tf2::Quaternion q; 
-    q.setRPY(3.14159, 0, yaw); 
+    q.setRPY(3.141, 0.01, yaw); 
     target_pose.orientation.x = q.x(); target_pose.orientation.y = q.y(); 
     target_pose.orientation.z = q.z(); target_pose.orientation.w = q.w();
     
     std::vector<geometry_msgs::msg::Pose> waypoints = {target_pose};
     moveit_msgs::msg::RobotTrajectory trajectory;
     
-    // avoid_collisions = false (L'ultimo parametro)
     double fraction = move_group_->computeCartesianPath(waypoints, 0.01, 0.0, trajectory, false);
     
     if (fraction > 0.9) {
       moveit::planning_interface::MoveGroupInterface::Plan plan;
       plan.trajectory_ = trajectory;
-      // Valutazione booleana sicura per ROS 2 Foxy
       if (move_group_->execute(plan)) return true;
     }
-    
-    failure_count_++;
-    if (failure_count_ >= max_retries_) emergency_stop_and_recover();
     return false;
   }
 
@@ -330,47 +315,32 @@ private:
     target_pose.position.x = x; target_pose.position.y = y; target_pose.position.z = z;
     
     tf2::Quaternion q; 
-    q.setRPY(3.14159, 0, yaw); 
+    q.setRPY(3.141, 0.01, yaw); 
     target_pose.orientation.x = q.x(); target_pose.orientation.y = q.y(); 
     target_pose.orientation.z = q.z(); target_pose.orientation.w = q.w();
     
     move_group_->setPoseTarget(target_pose);
     moveit::planning_interface::MoveGroupInterface::Plan plan;
     
-    // Valutazione booleana sicura per ROS 2 Foxy
     if (move_group_->plan(plan)) {
       if (move_group_->execute(plan)) {
-        failure_count_ = 0; 
         return true; 
       }
     }
-    
-    failure_count_++;
-    if (failure_count_ >= max_retries_) emergency_stop_and_recover();
     return false;
   }
 
   void emergency_stop_and_recover()
   {
-    RCLCPP_ERROR(this->get_logger(), "Errori multipli. EMERGENCY STOP e reset.");
+    RCLCPP_ERROR(this->get_logger(), "Errori. EMERGENCY STOP e reset.");
     try { move_group_->stop(); } catch (...) {}
     
     if (!attached_object_id_.empty()) {
         try { move_group_->detachObject(attached_object_id_); attached_object_id_ = ""; } catch (...) {}
         muovi_pinza("open");
     }
-    
     go_to_home();
-    failure_count_ = 0;
     rclcpp::sleep_for(std::chrono::seconds(2));
-  }
-
-  void log_metric(const std::string &event, bool success, const std::string &info)
-  {
-    if (!metrics_file_.is_open()) return;
-    double now = static_cast<double>(this->get_clock()->now().nanoseconds()) / 1e9;
-    metrics_file_ << now << "," << event << "," << (success?"1":"0") << "," << info << "\n";
-    metrics_file_.flush();
   }
 
   void muovi_pinza(std::string command)

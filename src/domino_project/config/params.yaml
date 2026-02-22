@@ -4,8 +4,8 @@ robot_mover_cpp:
       size: [0.06, 0.02, 0.02]
       spawn_z: 1.32
     approach:
-      z_high: 0.35
-      z_pick: 0.235
+      z_high: 1.45   # Ritirata sicura proporzionata
+      z_pick: 1.24   # La nuova quota di presa perfetta
       drop_x: 0.50
       drop_y: 0.00
     vision:
