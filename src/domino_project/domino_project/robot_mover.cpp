@@ -63,6 +63,8 @@ public:
     
     move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
     move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
+    move_group_->setPlanningTime(1.5);
+    move_group_->setNumPlanningAttempts(3);
 
     planning_scene_interface_ = std::make_shared<moveit::planning_interface::PlanningSceneInterface>();
     add_scene_collision_objects();
@@ -245,15 +247,26 @@ private:
   bool try_grasp_candidates(double x, double y, double target_yaw, double &out_x, double &out_y, double &out_yaw)
   {
     std::vector<double> lateral = {0.0, -0.01, 0.01};
-    std::vector<double> yaws = {target_yaw, target_yaw - 0.1, target_yaw + 0.1};
+    
+    // TRUCCO SIMMETRIA: Aggiungiamo target_yaw + 3.14159 (+180 gradi). 
+    // Se a -90° il polso si spezza, a +90° la mossa sarà fluidissima!
+    std::vector<double> yaws = {target_yaw, target_yaw + 3.14159, target_yaw - 3.14159, target_yaw - 0.1, target_yaw + 0.1};
 
     for (double dx : lateral) {
         for (double yaw : yaws) {
           double tx = x + dx;
           double ty = y;
           
-          if (!compute_cartesian_and_execute(tx, ty, z_alta_, yaw) && !plan_and_execute_pose(tx, ty, z_alta_, yaw)) continue;
-          if (!compute_cartesian_and_execute(tx, ty, z_presa_, yaw) && !plan_and_execute_pose(tx, ty, z_presa_, yaw)) continue;
+          RCLCPP_INFO(this->get_logger(), ">>> TENTATIVO OMPL -> X:%.2f Y:%.2f Yaw:%.2f", tx, ty, yaw);
+          
+          if (!plan_and_execute_pose(tx, ty, z_alta_, yaw)) {
+              continue; // Fallisce velocemente (1.5s) e prova subito l'angolo successivo!
+          }
+          
+          RCLCPP_INFO(this->get_logger(), ">>> FASE 2: Discesa...");
+          if (!compute_cartesian_and_execute(tx, ty, z_presa_, yaw) && !plan_and_execute_pose(tx, ty, z_presa_, yaw)) {
+              continue;
+          }
           
           muovi_pinza("close");
           rclcpp::sleep_for(std::chrono::milliseconds(500));
@@ -271,6 +284,7 @@ private:
           
           muovi_pinza("open");
           rclcpp::sleep_for(std::chrono::milliseconds(200));
+          compute_cartesian_and_execute(tx, ty, z_alta_, yaw);
         }
     }
     return false;

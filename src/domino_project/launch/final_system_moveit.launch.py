@@ -215,10 +215,29 @@ def generate_launch_description():
         ompl_planning_pipeline_config['move_group'].update(ompl_local)
 
     # Controllers
-    moveit_simple_controllers_yaml = load_yaml('panda_ros2_moveit2', 'config/panda_controllers.yaml') or {}
+    # Controllers espliciti (Bypassiamo i file YAML per evitare errori in Foxy)
     moveit_controllers = {
-        'moveit_simple_controller_manager': moveit_simple_controllers_yaml,
         'moveit_controller_manager': 'moveit_simple_controller_manager/MoveItSimpleControllerManager',
+        'moveit_simple_controller_manager': {
+            'controller_names': ['panda_arm_controller', 'panda_hand_controller'],
+            'panda_arm_controller': {
+                'action_ns': 'follow_joint_trajectory',
+                'type': 'FollowJointTrajectory',
+                'default': True,
+                'joints': [
+                    'panda_joint1', 'panda_joint2', 'panda_joint3', 
+                    'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7'
+                ]
+            },
+            'panda_hand_controller': {
+                'action_ns': 'follow_joint_trajectory',
+                'type': 'FollowJointTrajectory',
+                'default': True,
+                'joints': [
+                    'panda_finger_joint1', 'panda_finger_joint2'
+                ]
+            }
+        }
     }
 
     trajectory_execution = {
@@ -320,23 +339,22 @@ def generate_launch_description():
     return LaunchDescription([
         gazebo,
 
-        # bring up robot_state_publisher and static TF early, then spawn robot
+        # 1. Base robot
         TimerAction(period=1.0, actions=[static_tf, robot_state_publisher, spawn_robot]),
 
-        TimerAction(period=3.0, actions=[move_group]),
-        # Start RViz a bit after move_group if available
-        TimerAction(period=6.0, actions=[rviz_node] if rviz_node is not None else []),
+        # 2. Spawna oggetti in Gazebo
+        TimerAction(period=8.0, actions=[spawn_table]),
+        TimerAction(period=10.0, actions=[spawn_camera]),
+        TimerAction(period=12.0, actions=[spawn_domino1, spawn_domino2, spawn_domino3]),
 
-        # Spawna gli oggetti solo dopo che Gazebo è stabile
-        TimerAction(period=10.0, actions=[spawn_table]),
-        TimerAction(period=12.0, actions=[spawn_camera]),
-        TimerAction(period=14.0, actions=[spawn_domino1, spawn_domino2, spawn_domino3]),
+        # 3. Avvia i controller di Gazebo SOLO a 25 secondi (Diamo tempo a Gazebo di caricarsi)
+        TimerAction(period=25.0, actions=[joint_state_broadcaster, panda_arm_controller]),
+        TimerAction(period=28.0, actions=[panda_hand_controller]),
 
-        # Ritarda i controller per evitare il timeout
-        TimerAction(period=16.0, actions=[joint_state_broadcaster, panda_arm_controller]),
-        TimerAction(period=18.0, actions=[panda_hand_controller]),
-
-        # Avvia l'intelligenza artificiale e MoveIt alla fine
-        TimerAction(period=25.0, actions=[robot_mover_node, vision_node, vision_test_publisher]),
+        # 4. FONDAMENTALE: MoveIt a 40 secondi, così i controller sono sicuramente attivi
+        TimerAction(period=40.0, actions=[move_group]),
         
+        # 5. RViz e l'Intelligenza a 50 secondi
+        TimerAction(period=45.0, actions=[rviz_node] if rviz_node is not None else []),
+        TimerAction(period=50.0, actions=[robot_mover_node, vision_node, vision_test_publisher]),
     ])
