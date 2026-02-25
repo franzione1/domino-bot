@@ -1,23 +1,8 @@
 robot_mover_cpp:
   ros__parameters:
-    domino:
-      size: [0.06, 0.02, 0.02]
-      spawn_z: 1.32
-    approach:
-      z_high: 1.45   # Ritirata sicura proporzionata
-      z_pick: 1.24   # La nuova quota di presa perfetta
-      drop_x: 0.50
-      drop_y: 0.00
-    vision:
-      hsv_lower: [0.0, 0.3, 0.3]
-      hsv_upper: [1.0, 1.0, 1.0]
-    camera:
-      cam_x: 0.7
-      cam_y: 0.0
-      img_center_x: 400
-      img_center_y: 400
-      scale_x: -0.0020
-      scale_y: -0.0020
+    # z_high and z_pick are computed from DOMINO_SPAWN_Z in robot_mover.cpp
+    # and intentionally NOT overridden here.
+    simulate_gripper: false   # set true only if hand controller is unavailable
     planner:
       max_velocity_scaling: 0.4
       max_acceleration_scaling: 0.4
@@ -29,8 +14,10 @@ smart_domino_vision:
       cam_y: 0.0
       img_center_x: 400
       img_center_y: 400
-      scale_x: -0.0020
-      scale_y: -0.0020
+      # pixel-to-metre scale: 2 * (cam_z - piece_z) * tan(FOV/2) / img_width
+      #   = 2 * 0.98 * tan(40°) / 800 = 0.00206 m/px
+      scale_x: -0.00206
+      scale_y: -0.00206
     vision:
       hsv_lower: [0.0, 0.3, 0.3]
       hsv_upper: [1.0, 1.0, 1.0]

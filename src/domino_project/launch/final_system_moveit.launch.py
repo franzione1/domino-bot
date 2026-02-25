@@ -15,10 +15,10 @@ def generate_launch_description():
     urdf_path = None
     srdf_path = None
     candidate_pkgs = [
-        'moveit_resources_panda_moveit_config',
-        'panda_moveit_config',
+        'panda_ros2_moveit2',       # workspace-specific SRDF: group 'panda_gripper'
         'panda_ros2_gazebo',
-        'panda_ros2_moveit2',
+        'moveit_resources_panda_moveit_config',  # system SRDF: group 'hand' — MUST be last
+        'panda_moveit_config',
         'domino_project'
     ]
 
@@ -129,7 +129,7 @@ def generate_launch_description():
         executable="robot_state_publisher",
         name="robot_state_publisher",
         output="screen",
-        parameters=[{'robot_description': robot_desc}],
+        parameters=[{'robot_description': robot_desc, 'use_sim_time': True}],
     )
 
     spawn_robot = Node(
@@ -187,8 +187,8 @@ def generate_launch_description():
                 ]
             },
             'panda_hand_controller': {
-                'action_ns': 'follow_joint_trajectory',
-                'type': 'FollowJointTrajectory',
+                'action_ns': 'gripper_cmd',
+                'type': 'GripperCommand',
                 'default': True,
                 'joints': [
                     'panda_finger_joint1', 'panda_finger_joint2'
@@ -201,7 +201,7 @@ def generate_launch_description():
         'moveit_manage_controllers': True,
         'trajectory_execution.allowed_execution_duration_scaling': 1.2,
         'trajectory_execution.allowed_goal_duration_margin': 0.5,
-        'trajectory_execution.allowed_start_tolerance': 0.01,
+        'trajectory_execution.allowed_start_tolerance': 0.1,
     }
 
     planning_scene_monitor_parameters = {
@@ -254,14 +254,16 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'robot_description': robot_desc,
-            'robot_description_semantic': robot_desc_semantic
+            'robot_description_semantic': robot_desc_semantic,
+            'use_sim_time': True,
         }, os.path.join(my_pkg, 'config', 'params.yaml')]
     )
     
     vision_node = Node(
         package='domino_project',
         executable='vision_processor.py', 
-        output='screen'
+        output='screen',
+        parameters=[{'use_sim_time': True}]
     )
 
     vision_test_publisher = Node(
@@ -277,7 +279,7 @@ def generate_launch_description():
     spawn_camera = Node(package='gazebo_ros', executable='spawn_entity.py',
         arguments=['-entity', 'camera_sensor', '-file', camera_sdf, '-x', '0.7', '-y', '0.0', '-z', '2.3', '-R', '0.0', '-P', '1.57', '-Y', '0.0'], output='screen')
 
-    z_height = '1.32'
+    z_height = '1.45'
     spawn_domino1 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_rg', '-file', domino_rg, '-x', '0.5', '-y', '0.0', '-z', z_height], output='screen')
     spawn_domino2 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_gb', '-file', domino_gb, '-x', '0.5', '-y', '0.2', '-z', z_height], output='screen')
     spawn_domino3 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_br', '-file', domino_br, '-x', '0.5', '-y', '-0.2', '-z', z_height], output='screen')
@@ -296,5 +298,5 @@ def generate_launch_description():
         TimerAction(period=28.0, actions=[panda_hand_controller]),
         TimerAction(period=40.0, actions=[move_group]),
         TimerAction(period=45.0, actions=[rviz_node] if rviz_node is not None else []),
-        TimerAction(period=50.0, actions=[robot_mover_node, vision_node, vision_test_publisher]),
+        TimerAction(period=50.0, actions=[robot_mover_node, vision_node]),
     ])

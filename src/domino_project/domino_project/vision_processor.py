@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
+"""
+SmartDominoVision — perceives domino pieces on the table and publishes game-state.
+
+Published topics:
+  /domino_detections  (MarkerArray)
+      Marker id=0, ns='center' : the central piece (closest to table centre)
+      Marker id=1, ns='target' : the piece sharing a color with the central one
+      Each marker encodes:
+        pose.position.{x,y}   → real-world X,Y on the table
+        pose.orientation.{z,w} → sin/cos of the piece yaw (half-angle encoding)
+        color.{r,g,b}          → 1/0 flags: r=ROSSO, g=VERDE, b=BLU
+        color.a                → matching color code (1=ROSSO, 2=VERDE, 3=BLU)
+  /domino_pose  (Pose)  — legacy: target piece pose for backward compat.
+"""
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import Pose  # <--- Usiamo Pose invece di Point
+from geometry_msgs.msg import Pose
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import Header
 from cv_bridge import CvBridge
@@ -11,6 +25,14 @@ import cv2
 import numpy as np
 import math
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+# Table centre in world coordinates (must match spawn positions)
+TABLE_CENTER_X = 0.50
+TABLE_CENTER_Y = 0.00
+# Minimum centre-to-centre distance (m) for two pieces to be considered SEPARATE
+# (not yet touching).  Must exceed robot's CONTACT_OFFSET + 0.01 = 0.06 + 0.01 = 0.07 m
+# to avoid proposing already-placed pieces as targets.
+MIN_PIECE_SEPARATION = 0.07
 
 class SmartDominoVision(Node):
     def __init__(self):
@@ -46,54 +68,49 @@ class SmartDominoVision(Node):
         qos_policy = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
         self.subscription = self.create_subscription(Image, '/table_camera/image_raw', self.image_callback, qos_profile=qos_policy)
         
-        # NUOVO TOPIC: Pubblica una Pose completa (Posizione + Orientamento)
+        # Legacy pose topic
         self.coord_pub = self.create_publisher(Pose, '/domino_pose', 10)
+        # Rich game-state topic: two markers (center + target)
         self.detections_pub = self.create_publisher(MarkerArray, '/domino_detections', 10)
         
         self.bridge = CvBridge()
         self.last_print_time = 0
-        self.get_logger().info('VISION: Pronta. Calcolo angolo (Yaw) ATTIVO.')
+        self.get_logger().info('VISION: Pronta. Logica di Gioco Domino ATTIVA.')
 
     def image_callback(self, msg):
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        except: return
+        except Exception:
+            return
 
         hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-        blobs = [] 
-        
+        blobs = []
+
         for color_name, ranges in self.COLORS.items():
             mask = np.zeros(hsv_image.shape[:2], dtype="uint8")
             for (lower, upper) in ranges:
                 mask = cv2.bitwise_or(mask, cv2.inRange(hsv_image, lower, upper))
-            
-            kernel = np.ones((3,3), np.uint8)
+
+            kernel = np.ones((3, 3), np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            
+
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for c in contours:
-                if cv2.contourArea(c) > 80: 
-                    # 1. Trova il centro
+                if cv2.contourArea(c) > 80:
                     M = cv2.moments(c)
                     if M["m00"] != 0:
                         cx = int(M["m10"] / M["m00"])
                         cy = int(M["m01"] / M["m00"])
                         rx, ry = self.pixel_to_real(cx, cy)
-                        
-                        # 2. Calcola il rettangolo e l'angolo (Orientamento del pezzo)
+
                         rect = cv2.minAreaRect(c)
-                        (rect_cx, rect_cy), (width, height), angle = rect
-                        
-                        # OpenCV calcola l'angolo in modo particolare.
-                        # Vogliamo allinearci al lato lungo del domino
+                        (_, _), (width, height), angle = rect
                         if width < height:
                             angle = angle - 90
-                            
-                        # Convertiamo da gradi a radianti per MoveIt/ROS
                         yaw = math.radians(angle)
-                        
+
                         blobs.append({
-                            'colore': color_name, 'cx': cx, 'cy': cy, 
+                            'colore': color_name, 'cx': cx, 'cy': cy,
                             'rx': rx, 'ry': ry, 'yaw': yaw, 'rect': rect
                         })
 
@@ -102,63 +119,137 @@ class SmartDominoVision(Node):
             cv2.waitKey(1)
             return
 
-        blobs.sort(key=lambda b: math.sqrt((b['rx'] - 0.50)**2 + (b['ry'] - 0.00)**2))
-        central_blob = blobs[0]
-        
-        # Disegna il box orientato per il pezzo centrale
-        box_c = np.int0(cv2.boxPoints(central_blob['rect']))
-        cv2.drawContours(cv_image, [box_c], 0, (0, 255, 255), 2)
+        # ── Step 1: group blobs that belong to the SAME domino piece ──────────
+        # Two blobs whose centres are within DOMINO_HALF_LEN of each other are
+        # halves of the same tile.  We represent each tile as the centroid of
+        # its two halves plus the list of colours it carries.
+        DOMINO_HALF_LEN = 0.05  # metres – half the long axis of a domino
+        used = [False] * len(blobs)
+        pieces = []  # list of dicts: {rx, ry, yaw, colors: [c1], [c1,c2]}
 
-        target_blob = None
-        for b in blobs:
-            if b == central_blob: continue
-            if b['colore'] == central_blob['colore']:
-                if math.sqrt((b['rx'] - central_blob['rx'])**2 + (b['ry'] - central_blob['ry'])**2) > 0.04:
-                    target_blob = b
+        for i, b in enumerate(blobs):
+            if used[i]:
+                continue
+            piece_blobs = [b]
+            used[i] = True
+            for j, b2 in enumerate(blobs):
+                if used[j]:
+                    continue
+                dist = math.sqrt((b['rx'] - b2['rx']) ** 2 + (b['ry'] - b2['ry']) ** 2)
+                if dist < DOMINO_HALF_LEN:
+                    piece_blobs.append(b2)
+                    used[j] = True
+
+            rx = sum(p['rx'] for p in piece_blobs) / len(piece_blobs)
+            ry = sum(p['ry'] for p in piece_blobs) / len(piece_blobs)
+            yaw = piece_blobs[0]['yaw']
+            colors = list({p['colore'] for p in piece_blobs})
+            pieces.append({'rx': rx, 'ry': ry, 'yaw': yaw, 'colors': colors, 'blobs': piece_blobs})
+
+        if not pieces:
+            cv2.imshow("Smart Vision", cv_image)
+            cv2.waitKey(1)
+            return
+
+        # ── Step 2: identify the CENTER piece (closest to table origin) ───────
+        pieces.sort(key=lambda p: math.sqrt((p['rx'] - TABLE_CENTER_X) ** 2 + (p['ry'] - TABLE_CENTER_Y) ** 2))
+        center_piece = pieces[0]
+
+        # ── Step 3: find the TARGET piece that shares at least one color ──────
+        target_piece = None
+        matching_color = None
+        for piece in pieces[1:]:
+            shared = set(center_piece['colors']) & set(piece['colors'])
+            if shared:
+                dist = math.sqrt((piece['rx'] - center_piece['rx']) ** 2 + (piece['ry'] - center_piece['ry']) ** 2)
+                if dist > MIN_PIECE_SEPARATION:
+                    target_piece = piece
+                    matching_color = sorted(shared)[0]  # deterministic choice
                     break
-        
-        if target_blob:
-            # Disegna il box orientato per il pezzo target
-            box_t = np.int0(cv2.boxPoints(target_blob['rect']))
-            cv2.drawContours(cv_image, [box_t], 0, (0, 255, 0), 2)
-            cv2.putText(cv_image, f"TGT {target_blob['colore']} ({math.degrees(target_blob['yaw']):.1f} deg)", 
-                        (target_blob['cx'] - 40, target_blob['cy'] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-            
-            # Crea e pubblica la Pose
+
+        # ── Step 4: draw debug overlay ────────────────────────────────────────
+        def draw_piece(piece, bgr_color, label):
+            for b in piece['blobs']:
+                box = np.int0(cv2.boxPoints(b['rect']))
+                cv2.drawContours(cv_image, [box], 0, bgr_color, 2)
+            px, py = int(piece['blobs'][0]['cx']), int(piece['blobs'][0]['cy'])
+            cv2.putText(cv_image, label, (px - 40, py - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr_color, 2)
+
+        draw_piece(center_piece, (0, 255, 255),
+                   f"CTR {'+'.join(center_piece['colors'])}")
+
+        if target_piece and matching_color:
+            draw_piece(target_piece, (0, 255, 0),
+                       f"TGT {'+'.join(target_piece['colors'])} match={matching_color}")
+
+            # ── Step 5: build and publish the MarkerArray ─────────────────────
+            stamp = self.get_clock().now().to_msg()
+            ma = MarkerArray()
+
+            def make_marker(piece, ns, mid, match_color):
+                """Pack a piece into a Marker.
+                color.{r,g,b} ∈ {0,1} flags for ROSSO/VERDE/BLU.
+                color.a       = matching color code (COLOR_CODES).
+                orientation   = yaw half-angle quaternion (z/w only).
+                """
+                m = Marker()
+                m.header = Header(frame_id='world')
+                m.header.stamp = stamp
+                m.ns = ns
+                m.id = mid
+                m.type = Marker.CUBE
+                m.action = Marker.ADD
+                m.pose.position.x = piece['rx']
+                m.pose.position.y = piece['ry']
+                m.pose.position.z = 1.32
+                m.pose.orientation.x = 0.0
+                m.pose.orientation.y = 0.0
+                m.pose.orientation.z = math.sin(piece['yaw'] / 2.0)
+                m.pose.orientation.w = math.cos(piece['yaw'] / 2.0)
+                m.scale.x = 0.06
+                m.scale.y = 0.03
+                # scale.z repurposed: world-frame angle (rad) from piece centre
+                # to its matching-colour half.  The robot uses this to place
+                # pieces end-to-end with matching colours physically touching.
+                # (Visualisation: cube will appear flat in z — acceptable.)
+                match_blob = next(
+                    (b for b in piece['blobs'] if b['colore'] == match_color), None)
+                if match_blob:
+                    m.scale.z = math.atan2(
+                        match_blob['ry'] - piece['ry'],
+                        match_blob['rx'] - piece['rx'])
+                else:
+                    m.scale.z = piece['yaw']  # fallback: assume match on +X side
+                m.color.r = 1.0 if 'ROSSO' in piece['colors'] else 0.0
+                m.color.g = 1.0 if 'VERDE' in piece['colors'] else 0.0
+                m.color.b = 1.0 if 'BLU' in piece['colors'] else 0.0
+                m.color.a = self.COLOR_CODES.get(match_color, 0.0)
+                return m
+
+            # id=0 ns='center' → the piece that stays on the table
+            ma.markers.append(make_marker(center_piece, 'center', 0, matching_color))
+            # id=1 ns='target' → the piece the robot must pick and place
+            ma.markers.append(make_marker(target_piece, 'target', 1, matching_color))
+            self.detections_pub.publish(ma)
+
+            # Legacy /domino_pose (target piece only)
             p = Pose()
-            p.position.x = target_blob['rx']
-            p.position.y = target_blob['ry']
-            p.position.z = self.COLOR_CODES.get(target_blob['colore'], 0.0) 
-            
-            # Converti lo Yaw in Quaternione per ROS
+            p.position.x = target_piece['rx']
+            p.position.y = target_piece['ry']
+            p.position.z = self.COLOR_CODES.get(matching_color, 0.0)
             p.orientation.x = 0.0
             p.orientation.y = 0.0
-            p.orientation.z = math.sin(target_blob['yaw'] / 2.0)
-            p.orientation.w = math.cos(target_blob['yaw'] / 2.0)
+            p.orientation.z = math.sin(target_piece['yaw'] / 2.0)
+            p.orientation.w = math.cos(target_piece['yaw'] / 2.0)
             self.coord_pub.publish(p)
 
-            # Marker visivi per RViz
-            marker = Marker()
-            marker.header = Header(frame_id='world')
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = 'domino_detections'
-            marker.id = 0
-            marker.type = Marker.CUBE
-            marker.action = Marker.ADD
-            marker.pose = p # Assegniamo la posa calcolata!
-            marker.pose.position.z = 1.32 # Altezza visiva sul tavolo
-            marker.scale.x = 0.06; marker.scale.y = 0.03; marker.scale.z = 0.02
-            
-            col = {'ROSSO': (1.0,0.0,0.0), 'BLU': (0.0,0.0,1.0), 'VERDE': (0.0,1.0,0.0)}.get(target_blob['colore'], (1.0,1.0,1.0))
-            marker.color.r = col[0]; marker.color.g = col[1]; marker.color.b = col[2]; marker.color.a = 0.9
-            
-            ma = MarkerArray()
-            ma.markers.append(marker)
-            self.detections_pub.publish(ma)
-            
             now = self.get_clock().now().nanoseconds / 1e9
             if now - self.last_print_time > 2.0:
-                self.get_logger().info(f"Target {target_blob['colore']}: X={p.position.x:.3f}, Y={p.position.y:.3f}, Yaw={math.degrees(target_blob['yaw']):.1f}°")
+                self.get_logger().info(
+                    f"CENTER {'+'.join(center_piece['colors'])} @ ({center_piece['rx']:.3f},{center_piece['ry']:.3f}) | "
+                    f"TARGET {'+'.join(target_piece['colors'])} @ ({target_piece['rx']:.3f},{target_piece['ry']:.3f}) "
+                    f"match={matching_color}")
                 self.last_print_time = now
 
         cv2.imshow("Smart Vision", cv_image)

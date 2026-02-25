@@ -14,11 +14,11 @@ Visualization Manager:
     - Name: Planning Scene
       Class: moveit_ros_visualization/PlanningScene
       Enabled: true
-      Scene Topic: /planning_scene
+      Scene Topic: /monitored_planning_scene
     - Name: MotionPlanning
       Class: moveit_ros_visualization/MoveItMotionPlanningDisplay
       Enabled: true
-      Planning Scene Topic: /planning_scene
+      Planning Scene Topic: /monitored_planning_scene
     - Name: Domino Detections
       Class: rviz_default_plugins/MarkerArray
       Enabled: true
