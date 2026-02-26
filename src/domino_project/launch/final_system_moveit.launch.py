@@ -188,8 +188,8 @@ def generate_launch_description():
                 ]
             },
             'panda_hand_controller': {
-                'action_ns': 'gripper_cmd',
-                'type': 'GripperCommand',
+                'action_ns': 'follow_joint_trajectory',
+                'type': 'FollowJointTrajectory',
                 'default': True,
                 'joints': [
                     'panda_finger_joint1', 'panda_finger_joint2'
@@ -275,7 +275,7 @@ def generate_launch_description():
     spawn_camera = Node(package='gazebo_ros', executable='spawn_entity.py',
         arguments=['-entity', 'camera_sensor', '-file', camera_sdf, '-x', '0.7', '-y', '0.0', '-z', '2.3', '-R', '0.0', '-P', '1.57', '-Y', '0.0'], output='screen')
 
-    z_height = '1.32'
+    z_height = '1.31'  # table_top (1.30) + piece_thickness/2 (0.00375) + small drop margin
     spawn_domino1 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_rg', '-file', domino_rg, '-x', '0.5', '-y', '0.0', '-z', z_height], output='screen')
     spawn_domino2 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_gb', '-file', domino_gb, '-x', '0.5', '-y', '0.2', '-z', z_height], output='screen')
     spawn_domino3 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_br', '-file', domino_br, '-x', '0.5', '-y', '-0.2', '-z', z_height], output='screen')

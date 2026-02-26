@@ -21,8 +21,8 @@ import math
 
 # Must stay in sync with robot_mover.cpp / vision_processor.py
 TABLE_TOP_Z   = 1.30
-DOMINO_H      = 0.03
-DOMINO_REST_Z = TABLE_TOP_Z + DOMINO_H / 2.0   # 1.315 m
+DOMINO_H      = 0.0075
+DOMINO_REST_Z = TABLE_TOP_Z + DOMINO_H / 2.0   # 1.30375 m
 
 
 class TestPublisher(Node):
@@ -54,8 +54,8 @@ class TestPublisher(Node):
         center_yaw = 0.0
         center.pose.orientation.z = math.sin(center_yaw / 2.0)
         center.pose.orientation.w = math.cos(center_yaw / 2.0)
-        center.scale.x = 0.06
-        center.scale.y = 0.03
+        center.scale.x = 0.048
+        center.scale.y = 0.024
         # scale.z = match_angle: green half is at +x direction (angle 0 rad)
         center.scale.z = 0.0
         # color flags: r=1 g=1 → has red & green; a=2.0 → matching = VERDE
@@ -79,8 +79,8 @@ class TestPublisher(Node):
         target_yaw = 0.0
         target.pose.orientation.z = math.sin(target_yaw / 2.0)
         target.pose.orientation.w = math.cos(target_yaw / 2.0)
-        target.scale.x = 0.06
-        target.scale.y = 0.03
+        target.scale.x = 0.048
+        target.scale.y = 0.024
         # scale.z = match_angle: green half at −x direction (angle π)
         target.scale.z = math.pi
         # color flags: g=1 b=1 → has green & blue; a=2.0 → matching = VERDE

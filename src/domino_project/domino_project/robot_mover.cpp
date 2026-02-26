@@ -15,9 +15,15 @@
 
 // ─── Physical constants ───────────────────────────────────────────────────────
 // Domino piece dimensions (metres) — must match the SDF models
-const double DOMINO_LEN     = 0.06;   // long axis  (SDF x = 0.06)
-const double DOMINO_WID     = 0.03;   // short axis  (SDF y = 0.03)
-const double DOMINO_H       = 0.03;   // height      (SDF z = 0.03)
+// Sized to match the reference project (Robot-Domino-Artist):
+//   width=0.0075, length=0.024, height=0.048
+// In our SDF the piece lies FLAT on the table:
+//   SDF x = 0.048 (long axis on table)
+//   SDF y = 0.024 (short axis on table)
+//   SDF z = 0.0075 (thickness, faces up when lying flat)
+const double DOMINO_LEN     = 0.048;   // long axis  (SDF x)
+const double DOMINO_WID     = 0.024;   // short axis (SDF y) — gripper straddles this
+const double DOMINO_H       = 0.0075;  // thickness  (SDF z)
 
 // Environment geometry — derived from the Gazebo spawn configuration.
 // work_table/model.sdf: box 0.8×1.2×1.0 m, spawned at -z 0.8 (box centre)
@@ -26,8 +32,8 @@ const double TABLE_SPAWN_Z  = 0.80;
 const double TABLE_H        = 1.00;
 const double TABLE_TOP_Z    = TABLE_SPAWN_Z + TABLE_H / 2.0;   // 1.30 m
 
-// Pieces settle on the table: centre z = table top + half piece height
-const double DOMINO_REST_Z  = TABLE_TOP_Z + DOMINO_H / 2.0;    // 1.315 m
+// Pieces settle on the table: centre z = table top + half piece thickness
+const double DOMINO_REST_Z  = TABLE_TOP_Z + DOMINO_H / 2.0;    // 1.30375 m
 
 // ── Panda EEF chain (derived from the URDF, gripper pointing DOWN, roll=π) ──
 //   panda_link8  → panda_hand       : xyz="0 0 0"      (no z offset)
@@ -40,28 +46,22 @@ const double DOMINO_REST_Z  = TABLE_TOP_Z + DOMINO_H / 2.0;    // 1.315 m
 //   The arm reaches DOWNWARD — table top (1.30 m) is just below the robot base.
 const double PANDA_LINK8_TO_FINGERTIP = 0.0584 + 0.0538;   // 0.1122 m
 
-// ── Why the previous value was wrong ─────────────────────────────────────────
-// With panda_link8 at DOMINO_REST_Z + FINGERTIP_REACH = 1.4272 m:
-//   finger joint (top of grip zone) = 1.4322 - 0.0584 = 1.3738 m
-//   fingertip (bottom of grip zone) = 1.4322 - 0.1122 = 1.32 m  (piece CENTRE)
-//   → finger spans 1.32 m – 1.3738 m, piece spans 1.31 m – 1.33 m
-//   → only 1 cm overlap at the very tip   ← NEVER GRASPABLE
-//
-// Fix: lower until fingertips reach 5 mm above the table surface.
-//   → fingertip z = TABLE_TOP_Z + 0.005 = 1.305 m
-//   → full piece height (1.31–1.33 m) is inside the finger grip zone ✓
-//   → 5 mm clearance from table   (cartesian path uses avoid_collisions=false)
-const double Z_PRESA_DEFAULT = TABLE_TOP_Z + 0.005 + PANDA_LINK8_TO_FINGERTIP;
-//   = 1.30 + 0.005 + 0.1122 = 1.4172 m  (1.5 cm lower than before)
+// Grasp z: lower until fingertips reach 2 mm above the table surface.
+//   The piece is only 7.5 mm thick, so the finger grip zone must cover
+//   the full piece.  Fingertip z = TABLE_TOP_Z + 0.002 = 1.302 m
+//   Piece spans 1.300–1.3075 m  → entirely within grip zone ✓
+const double Z_PRESA_DEFAULT = TABLE_TOP_Z + 0.002 + PANDA_LINK8_TO_FINGERTIP;
+//   = 1.30 + 0.002 + 0.1122 = 1.4142 m
 
-// EEF z for safe transit: fingertips 15 cm above the piece top surface
+// EEF z for safe transit: fingertips 20 cm above the table surface
+// (reference uses 22 cm above object, we use a generous 20 cm above table)
 const double Z_ALTA_DEFAULT  =
-    DOMINO_REST_Z + DOMINO_H / 2.0 + 0.15 + PANDA_LINK8_TO_FINGERTIP;
-//   = 1.315 + 0.015 + 0.15 + 0.1122 = 1.5922 m
+    TABLE_TOP_Z + 0.20 + PANDA_LINK8_TO_FINGERTIP;
+//   = 1.30 + 0.20 + 0.1122 = 1.6122 m
 
 // Distance between centres when two pieces are placed touching end-to-end.
 // Both pieces have the same length, so the contact distance = LEN/2 + LEN/2 = LEN.
-const double CONTACT_OFFSET = DOMINO_LEN;   // 0.06 m
+const double CONTACT_OFFSET = DOMINO_LEN;   // 0.048 m
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -133,6 +133,9 @@ public:
       }
       RCLCPP_WARN(this->get_logger(), "Scene objects not confirmed yet (attempt %d/5).", attempt);
     }
+
+    // Diagnostic: verify which link MoveIt is planning for
+    RCLCPP_INFO(this->get_logger(), "MoveIt EEF link: '%s'", move_group_->getEndEffectorLink().c_str());
 
     go_to_home();
 
@@ -245,8 +248,8 @@ private:
 
     // ── 2. Pick the target piece ──────────────────────────────────────────
     // Compute the panda_link8 yaw that puts the fingers PERPENDICULAR to the
-    // piece long axis (so the fingers straddle the 0.03 m width, not the 0.06 m
-    // length).  Derivation:
+    // piece long axis (so the fingers straddle the 0.024 m short axis, not the
+    // 0.048 m long axis).  Derivation:
     //   panda_hand_joint applies Rz(-π/4) from panda_link8 → panda_hand.
     //   Fingers open along panda_hand Y.  With EEF roll=π (pointing down) and
     //   panda_link8 yaw=θ, the finger direction in world frame = angle (θ − π/4).
@@ -515,7 +518,7 @@ private:
     prim.type = shape_msgs::msg::SolidPrimitive::BOX;
     prim.dimensions = {DOMINO_LEN, DOMINO_WID, DOMINO_H};
     geometry_msgs::msg::Pose p;
-    p.position.z = 0.05;  // centred in the palm
+    p.position.z = 0.04;  // centred near fingertips (piece is only 7.5 mm thick)
     p.orientation.w = 1.0;
     obj.primitives.push_back(prim);
     obj.primitive_poses.push_back(p);
@@ -630,37 +633,60 @@ private:
     RCLCPP_INFO(this->get_logger(), "GRIPPER: %s  (simulate=%s)",
                 command.c_str(), simulate_gripper_ ? "true" : "false");
 
-    // ── 1. Activate / deactivate vacuum gripper in Gazebo ──────────────
+    // ── 1. Move MoveIt finger joints FIRST (before vacuum) ────────────
+    //   This ensures the fingers are physically positioned before the
+    //   vacuum creates a fixed joint.  The previous GripperCommand/
+    //   FollowJointTrajectory mismatch was causing this to silently fail.
+    if (!simulate_gripper_ && hand_group_) {
+      // Finger joint values (per-finger):
+      //   Close: 0.005 each → total gap 0.01 m (snug around 0.024 m short axis,
+      //          with vacuum gripper providing the actual hold)
+      //   Open:  0.04 each → total gap 0.08 m (clears all dimensions)
+      // Matches reference project: domino_length_closing = 0.01, open = 0.06
+      std::vector<double> target_joints =
+          is_close ? std::vector<double>{0.005, 0.005}
+                   : std::vector<double>{0.04, 0.04};
+
+      // Retry up to 3 times – the first attempt after startup sometimes
+      // fails because the controller hasn't fully connected.
+      bool finger_ok = false;
+      for (int attempt = 1; attempt <= 3 && !finger_ok; ++attempt) {
+        try {
+          hand_group_->setJointValueTarget(target_joints);
+          auto result = hand_group_->move();
+          if (result == moveit::planning_interface::MoveItErrorCode::SUCCESS) {
+            finger_ok = true;
+            RCLCPP_INFO(this->get_logger(), "GRIPPER: finger move succeeded (attempt %d)", attempt);
+          } else {
+            RCLCPP_WARN(this->get_logger(),
+                        "GRIPPER: finger move attempt %d failed (code %d), retrying...",
+                        attempt, result.val);
+            rclcpp::sleep_for(std::chrono::milliseconds(500));
+          }
+        } catch (const std::exception &e) {
+          RCLCPP_ERROR(this->get_logger(), "GRIPPER: exception on attempt %d: %s", attempt, e.what());
+          rclcpp::sleep_for(std::chrono::milliseconds(500));
+        }
+      }
+      if (!finger_ok) {
+        RCLCPP_ERROR(this->get_logger(), "GRIPPER: ALL finger move attempts failed!");
+      }
+      // Give the controller time to settle the physical joints
+      rclcpp::sleep_for(std::chrono::milliseconds(300));
+    } else if (simulate_gripper_) {
+      rclcpp::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    // ── 2. Activate / deactivate vacuum gripper in Gazebo ──────────────
     //   The Panda URDF loads libgazebo_ros_vacuum_gripper.so on
     //   panda_leftfinger.  Publishing true creates a fixed joint to the
     //   nearest object within max_distance (0.05 m).
+    //   Publish multiple times to ensure delivery in a laggy sim.
     std_msgs::msg::Bool vacuum_msg;
     vacuum_msg.data = is_close;
-    vacuum_gripper_pub_->publish(vacuum_msg);
-    // Publish a few times to ensure it gets through in a laggy sim
-    rclcpp::sleep_for(std::chrono::milliseconds(100));
-    vacuum_gripper_pub_->publish(vacuum_msg);
-
-    // ── 2. Move MoveIt finger joints (visual + additional clamping) ───
-    if (simulate_gripper_) {
-      rclcpp::sleep_for(std::chrono::milliseconds(500));
-      return;
-    }
-    if (!hand_group_) {
-      RCLCPP_WARN(this->get_logger(), "GRIPPER: hand_group_ is null, skipping joint move.");
-      return;
-    }
-    std::vector<double> joints =
-        is_close ? std::vector<double>{0.01, 0.01}
-                 : std::vector<double>{0.04, 0.04};
-    try {
-      hand_group_->setJointValueTarget(joints);
-      auto result = hand_group_->move();
-      if (result != moveit::planning_interface::MoveItErrorCode::SUCCESS) {
-        RCLCPP_WARN(this->get_logger(), "GRIPPER: move() returned error code %d", result.val);
-      }
-    } catch (const std::exception &e) {
-      RCLCPP_ERROR(this->get_logger(), "GRIPPER: exception: %s", e.what());
+    for (int i = 0; i < 3; ++i) {
+      vacuum_gripper_pub_->publish(vacuum_msg);
+      rclcpp::sleep_for(std::chrono::milliseconds(100));
     }
   }
 

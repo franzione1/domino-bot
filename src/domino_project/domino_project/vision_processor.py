@@ -30,13 +30,14 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 TABLE_CENTER_X = 0.50
 TABLE_CENTER_Y = 0.00
 # Physical constants — must match robot_mover.cpp and models
+# Reference project dimensions: 0.048 x 0.024 x 0.0075 m (lying flat)
 TABLE_TOP_Z    = 1.30
-DOMINO_H       = 0.03
-DOMINO_REST_Z  = TABLE_TOP_Z + DOMINO_H / 2.0   # 1.315 m
+DOMINO_H       = 0.0075
+DOMINO_REST_Z  = TABLE_TOP_Z + DOMINO_H / 2.0   # 1.30375 m
 # Minimum centre-to-centre distance (m) for two pieces to be considered SEPARATE
-# (not yet touching).  Must exceed robot's CONTACT_OFFSET + 0.01 = 0.06 + 0.01 = 0.07 m
+# (not yet touching).  Must exceed robot's CONTACT_OFFSET + 0.01 = 0.048 + 0.01 = 0.058 m
 # to avoid proposing already-placed pieces as targets.
-MIN_PIECE_SEPARATION = 0.07
+MIN_PIECE_SEPARATION = 0.06
 
 class SmartDominoVision(Node):
     def __init__(self):
@@ -131,7 +132,8 @@ class SmartDominoVision(Node):
         # Two blobs whose centres are within DOMINO_HALF_LEN of each other are
         # halves of the same tile.  We represent each tile as the centroid of
         # its two halves plus the list of colours it carries.
-        DOMINO_HALF_LEN = 0.04  # metres – max centre-to-centre of two halves of one tile
+        DOMINO_HALF_LEN = 0.035  # metres – max centre-to-centre of two halves of one tile
+                                  # piece long axis = 0.048 m, half-centres are ~0.024 apart
         used = [False] * len(blobs)
         pieces = []  # list of dicts: {rx, ry, yaw, colors: [c1], [c1,c2]}
 
@@ -150,7 +152,16 @@ class SmartDominoVision(Node):
 
             rx = sum(p['rx'] for p in piece_blobs) / len(piece_blobs)
             ry = sum(p['ry'] for p in piece_blobs) / len(piece_blobs)
-            yaw = piece_blobs[0]['yaw']
+            # Compute piece yaw (long-axis direction) from the LINE connecting
+            # the two half-centres.  Each visual half is a 24×24 mm square, so
+            # minAreaRect gives an unreliable angle for individual blobs.
+            # atan2 of the inter-blob vector gives the long axis reliably.
+            if len(piece_blobs) >= 2:
+                dx = piece_blobs[1]['rx'] - piece_blobs[0]['rx']
+                dy = piece_blobs[1]['ry'] - piece_blobs[0]['ry']
+                yaw = math.atan2(dy, dx)
+            else:
+                yaw = piece_blobs[0]['yaw']  # fallback for single-blob detection
             colors = list({p['colore'] for p in piece_blobs})
             pieces.append({'rx': rx, 'ry': ry, 'yaw': yaw, 'colors': colors, 'blobs': piece_blobs})
 

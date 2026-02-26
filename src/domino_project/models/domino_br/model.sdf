@@ -3,19 +3,19 @@
   <model name="domino_blue_red">
     <static>false</static>
     <link name="link">
-      
-    <inertial>
+      <!-- Dimensions match reference project: 0.048 x 0.024 x 0.0075 m -->
+      <inertial>
         <mass>0.05</mass>
         <inertia>
-          <ixx>7.5e-6</ixx><ixy>0</ixy><ixz>0</ixz>
-          <iyy>1.875e-5</iyy><iyz>0</iyz>
-          <izz>1.875e-5</izz>
+          <ixx>2.635e-6</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>9.834e-6</iyy><iyz>0</iyz>
+          <izz>1.200e-5</izz>
         </inertia>
-    </inertial>
+      </inertial>
       <collision name="collision">
         <geometry>
           <box>
-            <size>0.06 0.03 0.03</size>
+            <size>0.048 0.024 0.0075</size>
           </box>
         </geometry>
         <surface>
@@ -34,12 +34,12 @@
             </ode>
           </contact>
         </surface>
-        </collision>
+      </collision>
       <visual name="visual_left">
-        <pose>-0.015 0 0 0 0 0</pose>
+        <pose>-0.012 0 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.03 0.03 0.03</size>
+            <size>0.024 0.024 0.0075</size>
           </box>
         </geometry>
         <material>
@@ -49,12 +49,11 @@
           </script>
         </material>
       </visual>
-
       <visual name="visual_right">
-        <pose>0.015 0 0 0 0 0</pose>
+        <pose>0.012 0 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.03 0.03 0.03</size>
+            <size>0.024 0.024 0.0075</size>
           </box>
         </geometry>
         <material>
@@ -64,7 +63,6 @@
           </script>
         </material>
       </visual>
-
     </link>
   </model>
 </sdf>
