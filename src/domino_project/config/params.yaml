@@ -1,6 +1,6 @@
 robot_mover_cpp:
   ros__parameters:
-    # z_high and z_pick are computed from DOMINO_SPAWN_Z in robot_mover.cpp
+    # z_high and z_pick are computed from DOMINO_REST_Z in robot_mover.cpp
     # and intentionally NOT overridden here.
     simulate_gripper: false   # set true only if hand controller is unavailable
     planner:

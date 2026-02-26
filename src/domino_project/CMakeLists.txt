@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.5)
 project(domino_project)
 
-# Default to C++14
+# Default to C++17 (required by MoveIt2)
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
+  set(CMAKE_CXX_STANDARD 17)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -15,7 +15,9 @@ find_package(rclcpp REQUIRED)
 find_package(moveit_ros_planning_interface REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
-# visualization_msgs removed (not needed for core build)
+find_package(visualization_msgs REQUIRED)
+find_package(moveit_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 
 # --- NODO C++ ---
 # Usiamo il percorso dove hai attualmente il file
@@ -25,6 +27,9 @@ ament_target_dependencies(robot_mover_cpp
   moveit_ros_planning_interface
   geometry_msgs
   tf2_geometry_msgs
+  visualization_msgs
+  moveit_msgs
+  std_msgs
 )
 
 # --- QUESTA È LA PARTE CHE MANCAVA! ---

@@ -10,13 +10,14 @@
 #include <thread>
 #include <cmath>
 #include <visualization_msgs/msg/marker_array.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <fstream>
 
 // ─── Physical constants ───────────────────────────────────────────────────────
 // Domino piece dimensions (metres) — must match the SDF models
 const double DOMINO_LEN     = 0.06;   // long axis  (SDF x = 0.06)
 const double DOMINO_WID     = 0.03;   // short axis  (SDF y = 0.03)
-const double DOMINO_H       = 0.02;   // height      (SDF z = 0.02)
+const double DOMINO_H       = 0.03;   // height      (SDF z = 0.03)
 
 // Environment geometry — derived from the Gazebo spawn configuration.
 // work_table/model.sdf: box 0.8×1.2×1.0 m, spawned at -z 0.8 (box centre)
@@ -25,8 +26,8 @@ const double TABLE_SPAWN_Z  = 0.80;
 const double TABLE_H        = 1.00;
 const double TABLE_TOP_Z    = TABLE_SPAWN_Z + TABLE_H / 2.0;   // 1.30 m
 
-// Pieces are spawned at -z 1.32 (piece centre, 2 cm above table top)
-const double DOMINO_SPAWN_Z = 1.32;
+// Pieces settle on the table: centre z = table top + half piece height
+const double DOMINO_REST_Z  = TABLE_TOP_Z + DOMINO_H / 2.0;    // 1.315 m
 
 // ── Panda EEF chain (derived from the URDF, gripper pointing DOWN, roll=π) ──
 //   panda_link8  → panda_hand       : xyz="0 0 0"      (no z offset)
@@ -40,7 +41,7 @@ const double DOMINO_SPAWN_Z = 1.32;
 const double PANDA_LINK8_TO_FINGERTIP = 0.0584 + 0.0538;   // 0.1122 m
 
 // ── Why the previous value was wrong ─────────────────────────────────────────
-// With panda_link8 at DOMINO_SPAWN_Z + FINGERTIP_REACH = 1.4322 m:
+// With panda_link8 at DOMINO_REST_Z + FINGERTIP_REACH = 1.4272 m:
 //   finger joint (top of grip zone) = 1.4322 - 0.0584 = 1.3738 m
 //   fingertip (bottom of grip zone) = 1.4322 - 0.1122 = 1.32 m  (piece CENTRE)
 //   → finger spans 1.32 m – 1.3738 m, piece spans 1.31 m – 1.33 m
@@ -55,8 +56,8 @@ const double Z_PRESA_DEFAULT = TABLE_TOP_Z + 0.005 + PANDA_LINK8_TO_FINGERTIP;
 
 // EEF z for safe transit: fingertips 15 cm above the piece top surface
 const double Z_ALTA_DEFAULT  =
-    DOMINO_SPAWN_Z + DOMINO_H / 2.0 + 0.15 + PANDA_LINK8_TO_FINGERTIP;
-//   = 1.32 + 0.01 + 0.15 + 0.1122 = 1.5922 m
+    DOMINO_REST_Z + DOMINO_H / 2.0 + 0.15 + PANDA_LINK8_TO_FINGERTIP;
+//   = 1.315 + 0.015 + 0.15 + 0.1122 = 1.5922 m
 
 // Distance between centres when two pieces are placed touching end-to-end.
 // Both pieces have the same length, so the contact distance = LEN/2 + LEN/2 = LEN.
@@ -75,8 +76,11 @@ public:
       "/domino_detections", 10,
       std::bind(&RobotMover::detections_callback, this, std::placeholders::_1));
 
-    this->declare_parameter<bool>("simulate_gripper", true);
+    this->declare_parameter<bool>("simulate_gripper", false);
     simulate_gripper_ = this->get_parameter("simulate_gripper").as_bool();
+
+    // Vacuum gripper plugin on panda_leftfinger: toggle via /panda_hand/grasping
+    vacuum_gripper_pub_ = this->create_publisher<std_msgs::msg::Bool>("/panda_hand/grasping", 10);
 
     // z_alta_ and z_presa_ are derived from physical constants — not overridable
     z_alta_  = Z_ALTA_DEFAULT;
@@ -139,6 +143,7 @@ public:
 private:
   // ── ROS handles ──────────────────────────────────────────────────────────
   rclcpp::Subscription<visualization_msgs::msg::MarkerArray>::SharedPtr detections_sub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr vacuum_gripper_pub_;
   std::shared_ptr<moveit::planning_interface::MoveGroupInterface> move_group_;
   std::shared_ptr<moveit::planning_interface::MoveGroupInterface> hand_group_;
   std::shared_ptr<moveit::planning_interface::PlanningSceneInterface> planning_scene_interface_;
@@ -153,6 +158,14 @@ private:
   std::atomic_bool is_busy_{false};
   std::string attached_object_id_;
   std::ofstream metrics_file_;
+  std::thread worker_thread_;
+
+public:
+  ~RobotMover() {
+    if (worker_thread_.joinable()) worker_thread_.join();
+  }
+
+private:
 
   // ── Struct to hold a detected domino piece ───────────────────────────────
   struct DominoPiece {
@@ -207,10 +220,13 @@ private:
     if (std::sqrt(target.x * target.x + target.y * target.y) > 0.85) return;
 
     is_busy_ = true;
-    std::thread([this, center, target]() {
+    // Run mission on a separate thread so the executor keeps spinning.
+    // Store the thread so it can be joined on shutdown (no detach).
+    if (worker_thread_.joinable()) worker_thread_.join();
+    worker_thread_ = std::thread([this, center, target]() {
       execute_domino_play(center, target);
       is_busy_ = false;
-    }).detach();
+    });
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -290,11 +306,19 @@ private:
     // Sweep small offsets (no ±π — that would flip the matching-colour side).
     const std::vector<double> drop_yaw_offsets = {0.0, 0.1, -0.1, 0.2, -0.2, 0.3, -0.3};
     bool transit_ok = false;
+    int transit_attempt = 0;
     for (double dyo : drop_yaw_offsets) {
+      transit_attempt++;
       if (plan_and_execute(drop_x, drop_y, z_alta_, drop_yaw + dyo)) {
         drop_yaw += dyo;   // keep consistent with descent and retract
         transit_ok = true;
         break;
+      }
+      // After 3 failures, try ready position recovery
+      if (transit_attempt == 3 && !transit_ok) {
+        RCLCPP_WARN(this->get_logger(), "Multiple transit failures, trying ready position");
+        go_to_ready();
+        rclcpp::sleep_for(std::chrono::milliseconds(500));
       }
     }
     if (!transit_ok) {
@@ -305,18 +329,29 @@ private:
 
     // ── 6. Lower to place height ──────────────────────────────────────────
     // Release at the piece centre height so it settles flat on the table
-    double place_z = z_presa_;  // = DOMINO_SPAWN_Z = 1.32 m
-    if (!cartesian_move(drop_x, drop_y, place_z, drop_yaw)) {
-      if (!plan_and_execute(drop_x, drop_y, place_z, drop_yaw)) {
-        RCLCPP_ERROR(this->get_logger(), "LOWER TO PLACE FAILED – aborting.");
-        emergency_stop_and_recover();
-        return;
+    // Use Cartesian first (smoother descent), fallback to OMPL if needed
+    double place_z = z_presa_;  // fingertips just above the table surface
+    bool lowered = cartesian_move(drop_x, drop_y, place_z, drop_yaw);
+    if (!lowered) {
+      RCLCPP_WARN(this->get_logger(), "Cartesian lower failed, trying OMPL...");
+      lowered = plan_and_execute(drop_x, drop_y, place_z, drop_yaw);
+      if (!lowered) {
+        // One more retry via ready position
+        RCLCPP_WARN(this->get_logger(), "OMPL failed, recovery via ready...");
+        go_to_ready();
+        rclcpp::sleep_for(std::chrono::milliseconds(500));
+        lowered = plan_and_execute(drop_x, drop_y, place_z, drop_yaw);
       }
+    }
+    if (!lowered) {
+      RCLCPP_ERROR(this->get_logger(), "LOWER TO PLACE FAILED – aborting.");
+      emergency_stop_and_recover();
+      return;
     }
 
     // ── 7. Release piece ──────────────────────────────────────────────────
     muovi_pinza("open");
-    rclcpp::sleep_for(std::chrono::milliseconds(400));
+    rclcpp::sleep_for(std::chrono::milliseconds(1000));
 
     if (!attached_object_id_.empty()) {
       try { move_group_->detachObject(attached_object_id_); attached_object_id_ = ""; }
@@ -348,18 +383,30 @@ private:
     const double long_x = std::cos(piece_yaw_est);  // unit vec along piece long axis
     const double long_y = std::sin(piece_yaw_est);
 
+    int attempt_count = 0;
+    const int max_attempts = lateral_offsets.size() * yaw_offsets.size();
+    
     for (double dl : lateral_offsets) {
       for (double dy_yaw : yaw_offsets) {
+        attempt_count++;
         // Sweep along the piece LONG axis so the gripper stays centred over the piece
         double tx   = x + dl * long_x;
         double ty   = y + dl * long_y;
         double tyaw = yaw + dy_yaw;
 
         RCLCPP_INFO(this->get_logger(),
-          "  PICK attempt  X=%.3f Y=%.3f yaw=%.2f", tx, ty, tyaw);
+          "  PICK attempt %d/%d  X=%.3f Y=%.3f yaw=%.2f", 
+          attempt_count, max_attempts, tx, ty, tyaw);
 
-        // Approach above piece
-        if (!plan_and_execute(tx, ty, z_alta_, tyaw)) continue;
+        // Approach above piece - if fails after 3 tries, go to ready and retry
+        bool reached_above = plan_and_execute(tx, ty, z_alta_, tyaw);
+        if (!reached_above && attempt_count > 3) {
+          RCLCPP_WARN(this->get_logger(), "Multiple failures, trying ready position recovery");
+          go_to_ready();
+          rclcpp::sleep_for(std::chrono::milliseconds(500));
+          reached_above = plan_and_execute(tx, ty, z_alta_, tyaw);
+        }
+        if (!reached_above) continue;
 
         // Remove collision object so we can descend onto the piece
         std::string target_obj = find_closest_domino(tx, ty);
@@ -382,7 +429,7 @@ private:
 
         // Close gripper
         muovi_pinza("close");
-        rclcpp::sleep_for(std::chrono::milliseconds(600));
+        rclcpp::sleep_for(std::chrono::milliseconds(2000));
 
         // Attach the collision object to the end-effector so MoveIt tracks it
         if (!target_obj.empty()) {
@@ -444,7 +491,7 @@ private:
     prim.type = shape_msgs::msg::SolidPrimitive::BOX;
     prim.dimensions = {DOMINO_LEN, DOMINO_WID, DOMINO_H};
     geometry_msgs::msg::Pose p;
-    p.position.x = x; p.position.y = y; p.position.z = DOMINO_SPAWN_Z;
+    p.position.x = x; p.position.y = y; p.position.z = DOMINO_REST_Z;
     p.orientation.w = 1.0;
     obj.primitives.push_back(prim);
     obj.primitive_poses.push_back(p);
@@ -520,16 +567,23 @@ private:
   {
     auto current_state = move_group_->getCurrentState(2.0);
     if (!current_state) {
+      RCLCPP_WARN(this->get_logger(), "plan_and_execute: getCurrentState timed out");
       move_group_->setStartStateToCurrentState();
     } else {
       move_group_->setStartState(*current_state);
     }
     move_group_->setPoseTarget(make_pose(x, y, z, yaw));
     moveit::planning_interface::MoveGroupInterface::Plan plan;
-    if (move_group_->plan(plan) == moveit::planning_interface::MoveItErrorCode::SUCCESS) {
-      if (move_group_->execute(plan) == moveit::planning_interface::MoveItErrorCode::SUCCESS) {
+    auto plan_result = move_group_->plan(plan);
+    if (plan_result == moveit::planning_interface::MoveItErrorCode::SUCCESS) {
+      auto exec_result = move_group_->execute(plan);
+      if (exec_result == moveit::planning_interface::MoveItErrorCode::SUCCESS) {
         return true;
       }
+      RCLCPP_ERROR(this->get_logger(), "Execution failed: %d", exec_result.val);
+    } else {
+      RCLCPP_ERROR(this->get_logger(), "Planning failed: %d to (%.2f, %.2f, %.2f)",
+                   plan_result.val, x, y, z);
     }
     return false;
   }
@@ -550,52 +604,112 @@ private:
 
     std::vector<geometry_msgs::msg::Pose> waypoints = {make_pose(x, y, z, yaw)};
     moveit_msgs::msg::RobotTrajectory trajectory;
-    double fraction = move_group_->computeCartesianPath(waypoints, 0.01, 0.0, trajectory, false);
+    // Use smaller max_step (0.005 vs 0.01) for smoother Cartesian interpolation
+    // matching the reference implementation's approach
+    double fraction = move_group_->computeCartesianPath(waypoints, 0.005, 0.0, trajectory, false);
+    RCLCPP_INFO(this->get_logger(), "Cartesian path fraction: %.2f (goal: %.1f, %.1f, %.1f)",
+                fraction, x, y, z);
 
-    if (fraction > 0.85) {
+    if (fraction >= 0.95) {
       moveit::planning_interface::MoveGroupInterface::Plan plan;
       plan.trajectory_ = trajectory;
       if (move_group_->execute(plan) == moveit::planning_interface::MoveItErrorCode::SUCCESS) {
         return true;
       }
+      RCLCPP_ERROR(this->get_logger(), "Cartesian path execution failed");
+    } else {
+      RCLCPP_WARN(this->get_logger(),
+                  "Cartesian path coverage insufficient: %.2f < 0.95", fraction);
     }
     return false;
   }
 
   void muovi_pinza(const std::string &command)
   {
+    bool is_close = (command == "close");
+    RCLCPP_INFO(this->get_logger(), "GRIPPER: %s  (simulate=%s)",
+                command.c_str(), simulate_gripper_ ? "true" : "false");
+
+    // ── 1. Activate / deactivate vacuum gripper in Gazebo ──────────────
+    //   The Panda URDF loads libgazebo_ros_vacuum_gripper.so on
+    //   panda_leftfinger.  Publishing true creates a fixed joint to the
+    //   nearest object within max_distance (0.05 m).
+    std_msgs::msg::Bool vacuum_msg;
+    vacuum_msg.data = is_close;
+    vacuum_gripper_pub_->publish(vacuum_msg);
+    // Publish a few times to ensure it gets through in a laggy sim
+    rclcpp::sleep_for(std::chrono::milliseconds(100));
+    vacuum_gripper_pub_->publish(vacuum_msg);
+
+    // ── 2. Move MoveIt finger joints (visual + additional clamping) ───
     if (simulate_gripper_) {
-      rclcpp::sleep_for(std::chrono::milliseconds(300));
+      rclcpp::sleep_for(std::chrono::milliseconds(500));
       return;
     }
-    if (!hand_group_) return;
+    if (!hand_group_) {
+      RCLCPP_WARN(this->get_logger(), "GRIPPER: hand_group_ is null, skipping joint move.");
+      return;
+    }
     std::vector<double> joints =
-        (command == "open") ? std::vector<double>{0.04, 0.04}
-                             : std::vector<double>{0.00, 0.00};
+        is_close ? std::vector<double>{0.01, 0.01}
+                 : std::vector<double>{0.04, 0.04};
     try {
       hand_group_->setJointValueTarget(joints);
-      hand_group_->move();
-    } catch (...) {}
+      auto result = hand_group_->move();
+      if (result != moveit::planning_interface::MoveItErrorCode::SUCCESS) {
+        RCLCPP_WARN(this->get_logger(), "GRIPPER: move() returned error code %d", result.val);
+      }
+    } catch (const std::exception &e) {
+      RCLCPP_ERROR(this->get_logger(), "GRIPPER: exception: %s", e.what());
+    }
   }
 
   void go_to_home()
   {
     const std::vector<double> home = {0, -0.785, 0, -2.356, 0, 1.571, 0.785};
     try {
+      RCLCPP_INFO(this->get_logger(), "Moving to home position...");
       move_group_->setJointValueTarget(home);
-      move_group_->move();
-    } catch (...) {}
+      auto result = move_group_->move();
+      if (result != moveit::planning_interface::MoveItErrorCode::SUCCESS) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to move to home: %d", result.val);
+      }
+    } catch (const std::exception &e) {
+      RCLCPP_ERROR(this->get_logger(), "Exception in go_to_home: %s", e.what());
+    }
+  }
+
+  // Move to ready position (safer intermediate pose for retries)
+  void go_to_ready()
+  {
+    // Ready pose: slightly raised and centered for better reachability
+    const std::vector<double> ready = {0, -0.3, 0, -2.2, 0, 1.9, 0.785};
+    try {
+      RCLCPP_INFO(this->get_logger(), "Moving to ready position...");
+      move_group_->setJointValueTarget(ready);
+      auto result = move_group_->move();
+      if (result != moveit::planning_interface::MoveItErrorCode::SUCCESS) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to move to ready: %d", result.val);
+      }
+    } catch (const std::exception &e) {
+      RCLCPP_ERROR(this->get_logger(), "Exception in go_to_ready: %s", e.what());
+    }
   }
 
   void emergency_stop_and_recover()
   {
     RCLCPP_ERROR(this->get_logger(), "EMERGENCY STOP – recovering.");
     try { move_group_->stop(); } catch (...) {}
+    muovi_pinza("open");
     if (!attached_object_id_.empty()) {
-      try { move_group_->detachObject(attached_object_id_); attached_object_id_ = ""; }
-      catch (...) {}
-      muovi_pinza("open");
+      try {
+        move_group_->detachObject(attached_object_id_);
+        attached_object_id_ = "";
+      } catch (...) {}
     }
+    // Go to ready first, then home for safer recovery
+    go_to_ready();
+    rclcpp::sleep_for(std::chrono::seconds(1));
     go_to_home();
     rclcpp::sleep_for(std::chrono::seconds(2));
     log_event("emergency_stop", false, "recovered");

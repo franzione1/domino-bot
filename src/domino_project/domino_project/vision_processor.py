@@ -29,6 +29,10 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 # Table centre in world coordinates (must match spawn positions)
 TABLE_CENTER_X = 0.50
 TABLE_CENTER_Y = 0.00
+# Physical constants — must match robot_mover.cpp and models
+TABLE_TOP_Z    = 1.30
+DOMINO_H       = 0.03
+DOMINO_REST_Z  = TABLE_TOP_Z + DOMINO_H / 2.0   # 1.315 m
 # Minimum centre-to-centre distance (m) for two pieces to be considered SEPARATE
 # (not yet touching).  Must exceed robot's CONTACT_OFFSET + 0.01 = 0.06 + 0.01 = 0.07 m
 # to avoid proposing already-placed pieces as targets.
@@ -75,6 +79,7 @@ class SmartDominoVision(Node):
         
         self.bridge = CvBridge()
         self.last_print_time = 0
+        self.last_detection_time = 0  # throttle detection publishing
         self.get_logger().info('VISION: Pronta. Logica di Gioco Domino ATTIVA.')
 
     def image_callback(self, msg):
@@ -115,15 +120,18 @@ class SmartDominoVision(Node):
                         })
 
         if not blobs:
-            cv2.imshow("Smart Vision", cv_image)
-            cv2.waitKey(1)
+            try:
+                cv2.imshow("Smart Vision", cv_image)
+                cv2.waitKey(1)
+            except cv2.error:
+                pass
             return
 
         # ── Step 1: group blobs that belong to the SAME domino piece ──────────
         # Two blobs whose centres are within DOMINO_HALF_LEN of each other are
         # halves of the same tile.  We represent each tile as the centroid of
         # its two halves plus the list of colours it carries.
-        DOMINO_HALF_LEN = 0.05  # metres – half the long axis of a domino
+        DOMINO_HALF_LEN = 0.04  # metres – max centre-to-centre of two halves of one tile
         used = [False] * len(blobs)
         pieces = []  # list of dicts: {rx, ry, yaw, colors: [c1], [c1,c2]}
 
@@ -147,8 +155,11 @@ class SmartDominoVision(Node):
             pieces.append({'rx': rx, 'ry': ry, 'yaw': yaw, 'colors': colors, 'blobs': piece_blobs})
 
         if not pieces:
-            cv2.imshow("Smart Vision", cv_image)
-            cv2.waitKey(1)
+            try:
+                cv2.imshow("Smart Vision", cv_image)
+                cv2.waitKey(1)
+            except cv2.error:
+                pass
             return
 
         # ── Step 2: identify the CENTER piece (closest to table origin) ───────
@@ -184,6 +195,17 @@ class SmartDominoVision(Node):
                        f"TGT {'+'.join(target_piece['colors'])} match={matching_color}")
 
             # ── Step 5: build and publish the MarkerArray ─────────────────────
+            now_sec = self.get_clock().now().nanoseconds / 1e9
+            if now_sec - self.last_detection_time < 0.5:
+                # Throttle: don't flood robot_mover faster than 2 Hz
+                try:
+                    cv2.imshow("Smart Vision", cv_image)
+                    cv2.waitKey(1)
+                except cv2.error:
+                    pass
+                return
+            self.last_detection_time = now_sec
+
             stamp = self.get_clock().now().to_msg()
             ma = MarkerArray()
 
@@ -202,7 +224,7 @@ class SmartDominoVision(Node):
                 m.action = Marker.ADD
                 m.pose.position.x = piece['rx']
                 m.pose.position.y = piece['ry']
-                m.pose.position.z = 1.32
+                m.pose.position.z = DOMINO_REST_Z
                 m.pose.orientation.x = 0.0
                 m.pose.orientation.y = 0.0
                 m.pose.orientation.z = math.sin(piece['yaw'] / 2.0)
@@ -252,8 +274,11 @@ class SmartDominoVision(Node):
                     f"match={matching_color}")
                 self.last_print_time = now
 
-        cv2.imshow("Smart Vision", cv_image)
-        cv2.waitKey(1)
+        try:
+            cv2.imshow("Smart Vision", cv_image)
+            cv2.waitKey(1)
+        except cv2.error:
+            pass
 
     def pixel_to_real(self, u, v):
         real_x = self.CAMERA_X + (v - self.IMG_CENTER_Y) * self.SCALE_X
@@ -269,7 +294,10 @@ def main(args=None):
         pass
     node.destroy_node()
     rclpy.shutdown()
-    cv2.destroyAllWindows()
+    try:
+        cv2.destroyAllWindows()
+    except cv2.error:
+        pass
 
 if __name__ == '__main__':
     main()

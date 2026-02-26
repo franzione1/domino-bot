@@ -59,6 +59,19 @@ def generate_launch_description():
         with open(srdf_path, 'r') as f:
             robot_desc_semantic = f.read()
 
+    if xacro_path is not None:
+        doc = xacro.parse(open(xacro_path))
+        xacro.process_doc(doc, mappings={
+            'cell_layout_1': 'false',
+            'cell_layout_2': 'true',
+            'EE_no': 'true',
+        })
+        robot_desc = doc.toxml()
+    else:
+        with open(urdf_path, 'r') as f:
+            robot_desc = f.read()
+
+    # --- SRDF virtual_joint patching (must run after robot_desc is defined) ---
     try:
         import xml.etree.ElementTree as ET
         urdf_root = None
@@ -88,18 +101,6 @@ def generate_launch_description():
                 pass
     except Exception:
         pass
-
-    if xacro_path is not None:
-        doc = xacro.parse(open(xacro_path))
-        xacro.process_doc(doc, mappings={
-            'cell_layout_1': 'false',
-            'cell_layout_2': 'true',
-            'EE_no': 'true',
-        })
-        robot_desc = doc.toxml()
-    else:
-        with open(urdf_path, 'r') as f:
-            robot_desc = f.read()
 
     # --- 2. PERCORSI MODELLI SCENA ---
     domino_rg = os.path.join(my_pkg, 'models', 'domino_rg', 'model.sdf')
@@ -250,7 +251,8 @@ def generate_launch_description():
     
     robot_mover_node = Node(
         package='domino_project',
-        executable='robot_mover_cpp', 
+        executable='robot_mover_cpp',
+        name='robot_mover_cpp',
         output='screen',
         parameters=[{
             'robot_description': robot_desc,
@@ -262,15 +264,9 @@ def generate_launch_description():
     vision_node = Node(
         package='domino_project',
         executable='vision_processor.py', 
+        name='smart_domino_vision',
         output='screen',
-        parameters=[{'use_sim_time': True}]
-    )
-
-    vision_test_publisher = Node(
-        package='domino_project',
-        executable='vision_test_publisher.py',
-        name='vision_test_publisher',
-        output='screen'
+        parameters=[{'use_sim_time': True}, os.path.join(my_pkg, 'config', 'params.yaml')]
     )
 
     spawn_table = Node(package='gazebo_ros', executable='spawn_entity.py',
@@ -279,7 +275,7 @@ def generate_launch_description():
     spawn_camera = Node(package='gazebo_ros', executable='spawn_entity.py',
         arguments=['-entity', 'camera_sensor', '-file', camera_sdf, '-x', '0.7', '-y', '0.0', '-z', '2.3', '-R', '0.0', '-P', '1.57', '-Y', '0.0'], output='screen')
 
-    z_height = '1.45'
+    z_height = '1.32'
     spawn_domino1 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_rg', '-file', domino_rg, '-x', '0.5', '-y', '0.0', '-z', z_height], output='screen')
     spawn_domino2 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_gb', '-file', domino_gb, '-x', '0.5', '-y', '0.2', '-z', z_height], output='screen')
     spawn_domino3 = Node(package='gazebo_ros', executable='spawn_entity.py', arguments=['-entity', 'domino_br', '-file', domino_br, '-x', '0.5', '-y', '-0.2', '-z', z_height], output='screen')
