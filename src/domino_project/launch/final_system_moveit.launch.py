@@ -177,7 +177,7 @@ def generate_launch_description():
     moveit_controllers = {
         'moveit_controller_manager': 'moveit_simple_controller_manager/MoveItSimpleControllerManager',
         'moveit_simple_controller_manager': {
-            'controller_names': ['panda_arm_controller', 'panda_hand_controller'],
+            'controller_names': ['panda_arm_controller', 'panda_handleft_controller', 'panda_handright_controller'],
             'panda_arm_controller': {
                 'action_ns': 'follow_joint_trajectory',
                 'type': 'FollowJointTrajectory',
@@ -187,12 +187,20 @@ def generate_launch_description():
                     'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7'
                 ]
             },
-            'panda_hand_controller': {
-                'action_ns': 'follow_joint_trajectory',
-                'type': 'FollowJointTrajectory',
+            'panda_handleft_controller': {
+                'action_ns': 'gripper_cmd',
+                'type': 'GripperCommand',
                 'default': True,
                 'joints': [
-                    'panda_finger_joint1', 'panda_finger_joint2'
+                    'panda_finger_joint1'
+                ]
+            },
+            'panda_handright_controller': {
+                'action_ns': 'gripper_cmd',
+                'type': 'GripperCommand',
+                'default': True,
+                'joints': [
+                    'panda_finger_joint2'
                 ]
             }
         }
@@ -282,7 +290,8 @@ def generate_launch_description():
     
     joint_state_broadcaster = Node(package="controller_manager", executable="spawner.py", arguments=["joint_state_broadcaster"])
     panda_arm_controller = Node(package="controller_manager", executable="spawner.py", arguments=["panda_arm_controller"])
-    panda_hand_controller = Node(package="controller_manager", executable="spawner.py", arguments=["panda_hand_controller"])
+    panda_handleft_controller = Node(package="controller_manager", executable="spawner.py", arguments=["panda_handleft_controller"])
+    panda_handright_controller = Node(package="controller_manager", executable="spawner.py", arguments=["panda_handright_controller"])
 
     return LaunchDescription([
         gazebo,
@@ -291,7 +300,7 @@ def generate_launch_description():
         TimerAction(period=10.0, actions=[spawn_camera]),
         TimerAction(period=12.0, actions=[spawn_domino1, spawn_domino2, spawn_domino3]),
         TimerAction(period=25.0, actions=[joint_state_broadcaster, panda_arm_controller]),
-        TimerAction(period=28.0, actions=[panda_hand_controller]),
+        TimerAction(period=28.0, actions=[panda_handleft_controller, panda_handright_controller]),
         TimerAction(period=40.0, actions=[move_group]),
         TimerAction(period=45.0, actions=[rviz_node] if rviz_node is not None else []),
         TimerAction(period=50.0, actions=[robot_mover_node, vision_node]),

@@ -46,12 +46,16 @@ const double DOMINO_REST_Z  = TABLE_TOP_Z + DOMINO_H / 2.0;    // 1.30375 m
 //   The arm reaches DOWNWARD — table top (1.30 m) is just below the robot base.
 const double PANDA_LINK8_TO_FINGERTIP = 0.0584 + 0.0538;   // 0.1122 m
 
-// Grasp z: lower until fingertips reach 2 mm above the table surface.
-//   The piece is only 7.5 mm thick, so the finger grip zone must cover
-//   the full piece.  Fingertip z = TABLE_TOP_Z + 0.002 = 1.302 m
-//   Piece spans 1.300–1.3075 m  → entirely within grip zone ✓
-const double Z_PRESA_DEFAULT = TABLE_TOP_Z + 0.002 + PANDA_LINK8_TO_FINGERTIP;
-//   = 1.30 + 0.002 + 0.1122 = 1.4142 m
+// Grasp z: fingertips at the piece centre height.
+//   The piece is only 7.5 mm thick.  Placing the fingertips at the piece
+//   centre (DOMINO_REST_Z = TABLE_TOP_Z + DOMINO_H/2 = 1.30375 m) keeps
+//   the finger collision meshes ABOVE the table collision object so MoveIt
+//   can actually plan the descent.  The vacuum gripper (max_distance 50 mm)
+//   handles the real attachment in Gazebo.
+//   Previous value (TABLE_TOP_Z − 1 mm) put the finger meshes INTO the table
+//   collision object → "Unable to sample any valid states for goal tree".
+const double Z_PRESA_DEFAULT = DOMINO_REST_Z + PANDA_LINK8_TO_FINGERTIP;
+//   = 1.30375 + 0.1122 = 1.41595 m  (fingertip at piece centre, ~4 mm above table)
 
 // EEF z for safe transit: fingertips 20 cm above the table surface
 // (reference uses 22 cm above object, we use a generous 20 cm above table)
@@ -106,6 +110,18 @@ public:
     } catch (const std::exception &e) {
       RCLCPP_ERROR(this->get_logger(), "MoveGroup error: %s", e.what());
       return;
+    }
+
+    // Slow gripper to avoid knocking pieces away (reference uses speed=0.05)
+    hand_group_->setMaxVelocityScalingFactor(0.3);
+    hand_group_->setMaxAccelerationScalingFactor(0.3);
+    hand_group_->setPlanningTime(5.0);
+
+    // Log gripper group info for diagnostics
+    RCLCPP_INFO(this->get_logger(), "GRIPPER group joints: %zu",
+                hand_group_->getJointNames().size());
+    for (const auto &jn : hand_group_->getJointNames()) {
+      RCLCPP_INFO(this->get_logger(), "  - %s", jn.c_str());
     }
 
     move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
@@ -233,9 +249,17 @@ private:
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // execute_domino_play
-  //   Full pick-and-place mission: pick `target`, place it adjacent to
-  //   `center` so that their matching colour sides touch.
+  // execute_domino_play — simplified linear pick-and-place sequence:
+  //
+  //   1. Hover above piece
+  //   2. Open fingers
+  //   3. Descend onto piece
+  //   4. Close fingers (grab)
+  //   5. Go directly to destination (above, then lower)
+  //   6. Open fingers (release)
+  //   7. Come back up (ready to search for next piece)
+  //
+  //   No intermediate poses.  Straight: source → destination → up.
   // ─────────────────────────────────────────────────────────────────────────
   void execute_domino_play(const DominoPiece &center, const DominoPiece &target)
   {
@@ -243,126 +267,155 @@ private:
       "MISSION START  center=(%.3f,%.3f)  target=(%.3f,%.3f) yaw=%.2f",
       center.x, center.y, target.x, target.y, target.yaw);
 
-    // ── 1. Open gripper ───────────────────────────────────────────────────
-    muovi_pinza("open");
-
-    // ── 2. Pick the target piece ──────────────────────────────────────────
-    // Compute the panda_link8 yaw that puts the fingers PERPENDICULAR to the
-    // piece long axis (so the fingers straddle the 0.024 m short axis, not the
-    // 0.048 m long axis).  Derivation:
-    //   panda_hand_joint applies Rz(-π/4) from panda_link8 → panda_hand.
-    //   Fingers open along panda_hand Y.  With EEF roll=π (pointing down) and
-    //   panda_link8 yaw=θ, the finger direction in world frame = angle (θ − π/4).
-    //   For fingers ⊥ piece long axis (piece yaw φ):
-    //     θ − π/4 = φ + π/2  →  θ = φ + 3π/4
+    // ── Grasp yaw: fingers ⊥ piece long axis ──────────────────────────────
     const double grasp_yaw = target.yaw + 3.0 * M_PI / 4.0;
-    double picked_x = target.x, picked_y = target.y, picked_yaw = grasp_yaw;
 
-    if (!pick_piece(picked_x, picked_y, picked_yaw)) {
-      RCLCPP_ERROR(this->get_logger(), "PICK FAILED – aborting.");
-      emergency_stop_and_recover();
-      return;
-    }
-
-    // ── 3. Lift to safe travel height ─────────────────────────────────────
-    RCLCPP_INFO(this->get_logger(), "Lifting piece to travel height…");
-    if (!cartesian_move(picked_x, picked_y, z_alta_, picked_yaw)) {
-      // Try OMPL as fallback
-      if (!plan_and_execute(picked_x, picked_y, z_alta_, picked_yaw)) {
-        RCLCPP_ERROR(this->get_logger(), "LIFT FAILED – aborting.");
-        emergency_stop_and_recover();
-        return;
-      }
-    }
-
-    // ── 4. Compute drop pose ──────────────────────────────────────────────
-    //
-    //  Correct domino placement: place target piece END-TO-END with center,
-    //  matching-colour sides physically touching.
-    //
-    //  center.match_angle  = world angle from center pos → center's matching-
-    //                        colour half (encoded by vision_processor in scale.z).
-    //
-    //  drop_pos = center_pos + unit(center.match_angle) × DOMINO_LEN
-    //           (= centre of target piece when its matching half abuts center's)
-    //
-    //  drop_yaw: rotate EEF so target's matching half faces BACK toward center.
-    //    Required target.match_angle at drop = center.match_angle + π
-    //    → delta_piece_yaw = (center.match_angle + π) − target.match_angle
-    //    → drop EEF yaw    = grasp_yaw + delta_piece_yaw
-    //
+    // ── Compute destination pose ──────────────────────────────────────────
     double drop_x = center.x + std::cos(center.match_angle) * DOMINO_LEN;
     double drop_y = center.y + std::sin(center.match_angle) * DOMINO_LEN;
-
     double delta_piece = (center.match_angle + M_PI) - target.match_angle;
-    // Normalise to (−π, π]
     while (delta_piece >  M_PI) delta_piece -= 2.0 * M_PI;
     while (delta_piece < -M_PI) delta_piece += 2.0 * M_PI;
     double drop_yaw = grasp_yaw + delta_piece;
 
     RCLCPP_INFO(this->get_logger(),
-      "Drop pose: (%.3f, %.3f)  center_match_angle=%.2f  delta_piece=%.2f",
-      drop_x, drop_y, center.match_angle, delta_piece);
+      "  Target piece @ (%.3f,%.3f)  Destination @ (%.3f,%.3f)",
+      target.x, target.y, drop_x, drop_y);
 
-    // ── 5. Transit above drop pose with IK yaw sweep ──────────────────────
-    // drop_yaw after delta_piece rotation may land in a bad IK region.
-    // Sweep small offsets (no ±π — that would flip the matching-colour side).
-    const std::vector<double> drop_yaw_offsets = {0.0, 0.1, -0.1, 0.2, -0.2, 0.3, -0.3};
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 1 — HOVER above piece
+    // ═══════════════════════════════════════════════════════════════════════
+    RCLCPP_INFO(this->get_logger(), "  STEP 1 — hovering above piece...");
+    move_group_->setMaxVelocityScalingFactor(0.3);
+    move_group_->setMaxAccelerationScalingFactor(0.3);
+
+    bool hover_ok = false;
+    const std::vector<double> yaw_tweaks = {0.0, 0.05, -0.05, 0.1, -0.1, M_PI};
+    double pick_yaw = grasp_yaw;
+    for (double dy : yaw_tweaks) {
+      if (plan_and_execute(target.x, target.y, z_alta_, grasp_yaw + dy)) {
+        pick_yaw = grasp_yaw + dy;
+        hover_ok = true;
+        break;
+      }
+    }
+    move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
+    move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
+
+    if (!hover_ok) {
+      RCLCPP_ERROR(this->get_logger(), "  Cannot reach above piece — aborting.");
+      emergency_stop_and_recover();
+      return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 2 — OPEN fingers
+    // ═══════════════════════════════════════════════════════════════════════
+    RCLCPP_INFO(this->get_logger(), "  STEP 2 — opening fingers...");
+    muovi_pinza("open");
+    rclcpp::sleep_for(std::chrono::seconds(2));
+
+    // Remove collision object so we can descend onto the piece
+    std::string target_obj = find_closest_domino(target.x, target.y);
+    if (!target_obj.empty()) {
+      planning_scene_interface_->removeCollisionObjects({target_obj});
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 3 — DESCEND onto piece
+    // ═══════════════════════════════════════════════════════════════════════
+    RCLCPP_INFO(this->get_logger(), "  STEP 3 — descending to z=%.4f ...", z_presa_);
+    move_group_->setPlanningTime(5.0);
+    move_group_->setNumPlanningAttempts(4);
+    bool descended = plan_and_execute(target.x, target.y, z_presa_, pick_yaw);
+    if (!descended) {
+      RCLCPP_WARN(this->get_logger(), "    IK descent failed, trying Cartesian...");
+      descended = cartesian_descend(target.x, target.y, z_alta_, z_presa_, pick_yaw);
+    }
+    if (!descended) {
+      RCLCPP_WARN(this->get_logger(), "    Cartesian failed, IK retry...");
+      descended = plan_and_execute(target.x, target.y, z_presa_, pick_yaw);
+    }
+    move_group_->setPlanningTime(10.0);
+    move_group_->setNumPlanningAttempts(15);
+
+    if (!descended) {
+      RCLCPP_ERROR(this->get_logger(), "  Cannot descend onto piece — aborting.");
+      if (!target_obj.empty()) add_domino_collision_object(target_obj, target.x, target.y);
+      emergency_stop_and_recover();
+      return;
+    }
+    rclcpp::sleep_for(std::chrono::seconds(1));  // settle
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 4 — CLOSE fingers (grab piece)
+    // ═══════════════════════════════════════════════════════════════════════
+    RCLCPP_INFO(this->get_logger(), "  STEP 4 — closing fingers...");
+    // Attach collision object BEFORE close so MoveIt knows the piece is held
+    if (!target_obj.empty()) {
+      add_domino_as_attached(target_obj);
+      attached_object_id_ = target_obj;
+    }
+    muovi_pinza("close");
+    rclcpp::sleep_for(std::chrono::seconds(2));
+    log_event("pick", true, "x=" + std::to_string(target.x));
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 5 — MOVE to destination (above drop, then lower)
+    // ═══════════════════════════════════════════════════════════════════════
+    RCLCPP_INFO(this->get_logger(), "  STEP 5a — transit above destination...");
+    move_group_->setMaxVelocityScalingFactor(0.3);
+    move_group_->setMaxAccelerationScalingFactor(0.3);
+
     bool transit_ok = false;
-    int transit_attempt = 0;
+    const std::vector<double> drop_yaw_offsets = {0.0, 0.1, -0.1, 0.2, -0.2, 0.3, -0.3};
     for (double dyo : drop_yaw_offsets) {
-      transit_attempt++;
       if (plan_and_execute(drop_x, drop_y, z_alta_, drop_yaw + dyo)) {
-        drop_yaw += dyo;   // keep consistent with descent and retract
+        drop_yaw += dyo;
         transit_ok = true;
         break;
       }
-      // After 3 failures, try ready position recovery
-      if (transit_attempt == 3 && !transit_ok) {
-        RCLCPP_WARN(this->get_logger(), "Multiple transit failures, trying ready position");
-        go_to_ready();
-        rclcpp::sleep_for(std::chrono::milliseconds(500));
-      }
     }
+    move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
+    move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
+
     if (!transit_ok) {
-      RCLCPP_ERROR(this->get_logger(), "TRANSIT TO DROP FAILED – aborting.");
+      RCLCPP_ERROR(this->get_logger(), "  Cannot reach above destination — aborting.");
       emergency_stop_and_recover();
       return;
     }
 
-    // ── 6. Lower to place height ──────────────────────────────────────────
-    // Release at the piece centre height so it settles flat on the table
-    // Use Cartesian first (smoother descent), fallback to OMPL if needed
-    double place_z = z_presa_;  // fingertips just above the table surface
-    bool lowered = cartesian_move(drop_x, drop_y, place_z, drop_yaw);
+    // Lower to placement height
+    RCLCPP_INFO(this->get_logger(), "  STEP 5b — lowering to place...");
+    bool lowered = cartesian_descend(drop_x, drop_y, z_alta_, z_presa_, drop_yaw);
     if (!lowered) {
-      RCLCPP_WARN(this->get_logger(), "Cartesian lower failed, trying OMPL...");
-      lowered = plan_and_execute(drop_x, drop_y, place_z, drop_yaw);
-      if (!lowered) {
-        // One more retry via ready position
-        RCLCPP_WARN(this->get_logger(), "OMPL failed, recovery via ready...");
-        go_to_ready();
-        rclcpp::sleep_for(std::chrono::milliseconds(500));
-        lowered = plan_and_execute(drop_x, drop_y, place_z, drop_yaw);
-      }
+      RCLCPP_WARN(this->get_logger(), "    Cartesian lower failed, trying IK...");
+      lowered = plan_and_execute(drop_x, drop_y, z_presa_, drop_yaw);
     }
     if (!lowered) {
-      RCLCPP_ERROR(this->get_logger(), "LOWER TO PLACE FAILED – aborting.");
+      RCLCPP_ERROR(this->get_logger(), "  Cannot lower to place — aborting.");
       emergency_stop_and_recover();
       return;
     }
 
-    // ── 7. Release piece ──────────────────────────────────────────────────
-    muovi_pinza("open");
-    rclcpp::sleep_for(std::chrono::milliseconds(1000));
-
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 6 — OPEN fingers (release piece)
+    // ═══════════════════════════════════════════════════════════════════════
+    RCLCPP_INFO(this->get_logger(), "  STEP 6 — releasing piece...");
     if (!attached_object_id_.empty()) {
       try { move_group_->detachObject(attached_object_id_); attached_object_id_ = ""; }
       catch (...) {}
     }
+    muovi_pinza("open");
+    rclcpp::sleep_for(std::chrono::seconds(2));
 
-    // ── 8. Retract and home ───────────────────────────────────────────────
-    cartesian_move(drop_x, drop_y, z_alta_, drop_yaw);
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 7 — COME BACK UP (ready to search for next piece)
+    // ═══════════════════════════════════════════════════════════════════════
+    RCLCPP_INFO(this->get_logger(), "  STEP 7 — coming back up...");
+    if (!cartesian_move(drop_x, drop_y, z_alta_, drop_yaw)) {
+      plan_and_execute(drop_x, drop_y, z_alta_, drop_yaw);
+    }
     go_to_home();
 
     RCLCPP_INFO(this->get_logger(), "MISSION COMPLETE – domino placed.");
@@ -370,81 +423,39 @@ private:
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // pick_piece
-  //   Approach-descend-grasp sequence with collision-object management.
+  // cartesian_descend — 2-point Cartesian straight-line descent
+  //   Adapted from reference: builds waypoints = [above_pose, grasp_pose]
+  //   so the planner has an explicit start→end pair for the vertical move.
   // ─────────────────────────────────────────────────────────────────────────
-  bool pick_piece(double x, double y, double yaw)
+  bool cartesian_descend(double x, double y, double z_start, double z_end, double yaw)
   {
-    // Try a small lateral sweep to handle IK degeneracies
-    const std::vector<double> lateral_offsets = {0.0, 0.01, -0.01, 0.02, -0.02};
-    // M_PI = grasp from opposite side (valid symmetric pose); -M_PI removed (duplicate of M_PI)
-    const std::vector<double> yaw_offsets      = {0.0, 0.05, -0.05, 0.1, M_PI};
+    auto current_state = move_group_->getCurrentState(2.0);
+    if (!current_state) {
+      RCLCPP_WARN(this->get_logger(), "cartesian_descend: getCurrentState timed out.");
+      move_group_->setStartStateToCurrentState();
+    } else {
+      move_group_->setStartState(*current_state);
+    }
 
-    // Recover piece yaw (long axis direction) from the grasp yaw.
-    // grasp_yaw = piece_yaw + 3π/4  →  piece_yaw = yaw − 3π/4
-    const double piece_yaw_est = yaw - 3.0 * M_PI / 4.0;
-    const double long_x = std::cos(piece_yaw_est);  // unit vec along piece long axis
-    const double long_y = std::sin(piece_yaw_est);
+    // Two-point Cartesian path: current height → grasp height
+    // (reference builds [p1=above, p2=grasp] as explicit waypoints)
+    std::vector<geometry_msgs::msg::Pose> waypoints;
+    waypoints.push_back(make_pose(x, y, z_start, yaw));  // start = above
+    waypoints.push_back(make_pose(x, y, z_end,   yaw));  // end   = grasp
 
-    int attempt_count = 0;
-    const int max_attempts = lateral_offsets.size() * yaw_offsets.size();
-    
-    for (double dl : lateral_offsets) {
-      for (double dy_yaw : yaw_offsets) {
-        attempt_count++;
-        // Sweep along the piece LONG axis so the gripper stays centred over the piece
-        double tx   = x + dl * long_x;
-        double ty   = y + dl * long_y;
-        double tyaw = yaw + dy_yaw;
+    moveit_msgs::msg::RobotTrajectory trajectory;
+    double fraction = move_group_->computeCartesianPath(waypoints, 0.005, 0.0, trajectory, false);
+    RCLCPP_INFO(this->get_logger(),
+      "Cartesian descend fraction: %.2f  (%.3f → %.3f)", fraction, z_start, z_end);
 
-        RCLCPP_INFO(this->get_logger(),
-          "  PICK attempt %d/%d  X=%.3f Y=%.3f yaw=%.2f", 
-          attempt_count, max_attempts, tx, ty, tyaw);
-
-        // Approach above piece - if fails after 3 tries, go to ready and retry
-        bool reached_above = plan_and_execute(tx, ty, z_alta_, tyaw);
-        if (!reached_above && attempt_count > 3) {
-          RCLCPP_WARN(this->get_logger(), "Multiple failures, trying ready position recovery");
-          go_to_ready();
-          rclcpp::sleep_for(std::chrono::milliseconds(500));
-          reached_above = plan_and_execute(tx, ty, z_alta_, tyaw);
-        }
-        if (!reached_above) continue;
-
-        // Remove collision object so we can descend onto the piece
-        std::string target_obj = find_closest_domino(tx, ty);
-        if (!target_obj.empty()) {
-          planning_scene_interface_->removeCollisionObjects({target_obj});
-        }
-
-        // Descend
-        bool descended = cartesian_move(tx, ty, z_presa_, tyaw);
-        if (!descended) {
-          descended = plan_and_execute(tx, ty, z_presa_, tyaw);
-        }
-        if (!descended) {
-          // Restore collision object and try next candidate
-          if (!target_obj.empty()) {
-            add_domino_collision_object(target_obj, tx, ty);
-          }
-          continue;
-        }
-
-        // Close gripper
-        muovi_pinza("close");
-        rclcpp::sleep_for(std::chrono::milliseconds(2000));
-
-        // Attach the collision object to the end-effector so MoveIt tracks it
-        if (!target_obj.empty()) {
-          add_domino_as_attached(target_obj);
-          attached_object_id_ = target_obj;
-        }
-
-        log_event("pick", true, "x=" + std::to_string(tx));
+    if (fraction >= 0.95) {
+      moveit::planning_interface::MoveGroupInterface::Plan plan;
+      plan.trajectory_ = trajectory;
+      if (move_group_->execute(plan) == moveit::planning_interface::MoveItErrorCode::SUCCESS) {
         return true;
       }
+      RCLCPP_ERROR(this->get_logger(), "Cartesian descend execution failed.");
     }
-    log_event("pick", false, "all_candidates_failed");
     return false;
   }
 
@@ -463,7 +474,8 @@ private:
     table.header.frame_id = "world";
     shape_msgs::msg::SolidPrimitive tp;
     tp.type = shape_msgs::msg::SolidPrimitive::BOX;
-    tp.dimensions = {0.8, 1.2, 1.0};   // height=1.0 matches SDF (was wrongly 0.5)
+    tp.dimensions = {0.8, 1.2, 0.99};  // 10 mm shorter than real table → collision top
+                                          //   at 1.295 m, giving ~9 mm clearance for fingers
     geometry_msgs::msg::Pose tpose;
     tpose.position.x = 0.7; tpose.position.y = 0.0; tpose.position.z = 0.80;
     tpose.orientation.w = 1.0;
@@ -633,34 +645,65 @@ private:
     RCLCPP_INFO(this->get_logger(), "GRIPPER: %s  (simulate=%s)",
                 command.c_str(), simulate_gripper_ ? "true" : "false");
 
-    // ── 1. Move MoveIt finger joints FIRST (before vacuum) ────────────
-    //   This ensures the fingers are physically positioned before the
-    //   vacuum creates a fixed joint.  The previous GripperCommand/
-    //   FollowJointTrajectory mismatch was causing this to silently fail.
+    // ── 1. Move finger joints via MoveIt hand_group_ ────────────────────
+    //   This mirrors the IFRA framework's moveG_action: get current state,
+    //   copy joint positions, set both finger values, plan & execute.
+    //   MoveIt routes through GripperCommand to the separate
+    //   panda_handleft_controller / panda_handright_controller.
     if (!simulate_gripper_ && hand_group_) {
       // Finger joint values (per-finger):
-      //   Close: 0.005 each → total gap 0.01 m (snug around 0.024 m short axis,
-      //          with vacuum gripper providing the actual hold)
-      //   Open:  0.04 each → total gap 0.08 m (clears all dimensions)
-      // Matches reference project: domino_length_closing = 0.01, open = 0.06
-      std::vector<double> target_joints =
-          is_close ? std::vector<double>{0.005, 0.005}
-                   : std::vector<double>{0.04, 0.04};
+      //   Close: 0.01 each → total gap 0.02 m (matches reference toggle_gripper)
+      //          Reference MoveIt: fer_finger_joint1=0.01, fer_finger_joint2=0.01
+      //          Reference hardware: gripper_width(0.01) → 0.005/finger
+      //          We use the MoveIt values since we're in Gazebo simulation.
+      //   Open:  0.03 each → total gap 0.06 m (matches reference domino_open_value)
+      double target_pos = is_close ? 0.01 : 0.03;
 
-      // Retry up to 3 times – the first attempt after startup sometimes
-      // fails because the controller hasn't fully connected.
       bool finger_ok = false;
       for (int attempt = 1; attempt <= 3 && !finger_ok; ++attempt) {
         try {
-          hand_group_->setJointValueTarget(target_joints);
-          auto result = hand_group_->move();
-          if (result == moveit::planning_interface::MoveItErrorCode::SUCCESS) {
-            finger_ok = true;
-            RCLCPP_INFO(this->get_logger(), "GRIPPER: finger move succeeded (attempt %d)", attempt);
+          // Get current gripper state (exactly as IFRA moveG_action does)
+          const auto *joint_model_group =
+              hand_group_->getCurrentState(10)->getJointModelGroup("panda_gripper");
+
+          moveit::core::RobotStatePtr current_state = hand_group_->getCurrentState(10);
+          std::vector<double> joint_positions;
+          current_state->copyJointGroupPositions(joint_model_group, joint_positions);
+
+          RCLCPP_INFO(this->get_logger(),
+              "GRIPPER: current positions [%.4f, %.4f], target %.4f (attempt %d)",
+              joint_positions.size() > 0 ? joint_positions[0] : -1.0,
+              joint_positions.size() > 1 ? joint_positions[1] : -1.0,
+              target_pos, attempt);
+
+          // Set BOTH finger joints to the target value
+          if (joint_positions.size() >= 2) {
+            joint_positions[0] = target_pos;
+            joint_positions[1] = target_pos;
+          }
+          hand_group_->setJointValueTarget(joint_positions);
+
+          // Plan and execute
+          moveit::planning_interface::MoveGroupInterface::Plan plan;
+          bool planned = (hand_group_->plan(plan) ==
+                          moveit::planning_interface::MoveItErrorCode::SUCCESS);
+
+          if (planned) {
+            RCLCPP_INFO(this->get_logger(), "GRIPPER: plan succeeded, executing...");
+            auto exec_result = hand_group_->execute(plan);
+            if (exec_result == moveit::planning_interface::MoveItErrorCode::SUCCESS) {
+              finger_ok = true;
+              RCLCPP_INFO(this->get_logger(), "GRIPPER: move executed successfully (attempt %d)", attempt);
+            } else {
+              RCLCPP_WARN(this->get_logger(),
+                  "GRIPPER: execution failed (code %d), attempt %d",
+                  exec_result.val, attempt);
+            }
           } else {
-            RCLCPP_WARN(this->get_logger(),
-                        "GRIPPER: finger move attempt %d failed (code %d), retrying...",
-                        attempt, result.val);
+            RCLCPP_WARN(this->get_logger(), "GRIPPER: planning failed, attempt %d", attempt);
+          }
+
+          if (!finger_ok) {
             rclcpp::sleep_for(std::chrono::milliseconds(500));
           }
         } catch (const std::exception &e) {
@@ -668,12 +711,13 @@ private:
           rclcpp::sleep_for(std::chrono::milliseconds(500));
         }
       }
+
       if (!finger_ok) {
         RCLCPP_ERROR(this->get_logger(), "GRIPPER: ALL finger move attempts failed!");
       }
-      // Give the controller time to settle the physical joints
-      rclcpp::sleep_for(std::chrono::milliseconds(300));
-    } else if (simulate_gripper_) {
+      // Give the controller time to settle (reference waits 2s)
+      rclcpp::sleep_for(std::chrono::milliseconds(1500));
+    } else {
       rclcpp::sleep_for(std::chrono::milliseconds(500));
     }
 
@@ -705,20 +749,25 @@ private:
     }
   }
 
-  // Move to ready position (safer intermediate pose for retries)
-  void go_to_ready()
+  // Move to the SRDF-defined 'ready' named configuration.
+  // Reference: try_plan(named_configuration='ready', vel, acc)
+  void go_to_ready(double vel = 0.8, double acc = 0.8)
   {
-    // Ready pose: slightly raised and centered for better reachability
-    const std::vector<double> ready = {0, -0.3, 0, -2.2, 0, 1.9, 0.785};
     try {
-      RCLCPP_INFO(this->get_logger(), "Moving to ready position...");
-      move_group_->setJointValueTarget(ready);
+      RCLCPP_INFO(this->get_logger(), "Moving to SRDF 'ready' (vel=%.1f, acc=%.1f)...", vel, acc);
+      move_group_->setMaxVelocityScalingFactor(vel);
+      move_group_->setMaxAccelerationScalingFactor(acc);
+      move_group_->setNamedTarget("ready");
       auto result = move_group_->move();
+      move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
+      move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
       if (result != moveit::planning_interface::MoveItErrorCode::SUCCESS) {
         RCLCPP_ERROR(this->get_logger(), "Failed to move to ready: %d", result.val);
       }
     } catch (const std::exception &e) {
       RCLCPP_ERROR(this->get_logger(), "Exception in go_to_ready: %s", e.what());
+      move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
+      move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
     }
   }
 
@@ -733,9 +782,6 @@ private:
         attached_object_id_ = "";
       } catch (...) {}
     }
-    // Go to ready first, then home for safer recovery
-    go_to_ready();
-    rclcpp::sleep_for(std::chrono::seconds(1));
     go_to_home();
     rclcpp::sleep_for(std::chrono::seconds(2));
     log_event("emergency_stop", false, "recovered");
