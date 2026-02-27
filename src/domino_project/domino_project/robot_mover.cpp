@@ -112,10 +112,13 @@ public:
       return;
     }
 
-    // Slow gripper to avoid knocking pieces away (reference uses speed=0.05)
-    hand_group_->setMaxVelocityScalingFactor(0.3);
-    hand_group_->setMaxAccelerationScalingFactor(0.3);
+    // Slow gripper to match reference hardware (gripper_width speed=0.05 m/s).
+    // URDF velocity limit = 0.2 m/s × scaling 0.1 = 0.02 m/s effective.
+    // Reference hardware closes 0.02 m range in ~0.4 s; we take ~1.0 s (safer in sim).
+    hand_group_->setMaxVelocityScalingFactor(0.1);
+    hand_group_->setMaxAccelerationScalingFactor(0.1);
     hand_group_->setPlanningTime(5.0);
+    hand_group_->setGoalJointTolerance(0.001);  // reference uses JointConstraint tolerance=0.001
 
     // Log gripper group info for diagnostics
     RCLCPP_INFO(this->get_logger(), "GRIPPER group joints: %zu",
@@ -129,7 +132,7 @@ public:
     move_group_->setPlanningTime(10.0);
     move_group_->setNumPlanningAttempts(15);
     move_group_->setGoalPositionTolerance(0.01);
-    move_group_->setGoalOrientationTolerance(0.1);
+    move_group_->setGoalOrientationTolerance(0.02);  // ~1° — tight enough to stay level
 
     planning_scene_interface_ = std::make_shared<moveit::planning_interface::PlanningSceneInterface>();
 
@@ -323,21 +326,20 @@ private:
 
     // ═══════════════════════════════════════════════════════════════════════
     //  STEP 3 — DESCEND onto piece
+    //   Cartesian FIRST — this keeps the EEF perfectly level throughout
+    //   the straight-line drop.  IK (plan_and_execute) is the fallback
+    //   because OMPL can freely tilt the orientation along the path.
     // ═══════════════════════════════════════════════════════════════════════
     RCLCPP_INFO(this->get_logger(), "  STEP 3 — descending to z=%.4f ...", z_presa_);
-    move_group_->setPlanningTime(5.0);
-    move_group_->setNumPlanningAttempts(4);
-    bool descended = plan_and_execute(target.x, target.y, z_presa_, pick_yaw);
+    bool descended = cartesian_descend(target.x, target.y, z_alta_, z_presa_, pick_yaw);
     if (!descended) {
-      RCLCPP_WARN(this->get_logger(), "    IK descent failed, trying Cartesian...");
-      descended = cartesian_descend(target.x, target.y, z_alta_, z_presa_, pick_yaw);
-    }
-    if (!descended) {
-      RCLCPP_WARN(this->get_logger(), "    Cartesian failed, IK retry...");
+      RCLCPP_WARN(this->get_logger(), "    Cartesian descent failed, trying IK...");
+      move_group_->setPlanningTime(5.0);
+      move_group_->setNumPlanningAttempts(4);
       descended = plan_and_execute(target.x, target.y, z_presa_, pick_yaw);
+      move_group_->setPlanningTime(10.0);
+      move_group_->setNumPlanningAttempts(15);
     }
-    move_group_->setPlanningTime(10.0);
-    move_group_->setNumPlanningAttempts(15);
 
     if (!descended) {
       RCLCPP_ERROR(this->get_logger(), "  Cannot descend onto piece — aborting.");
@@ -363,6 +365,15 @@ private:
     // ═══════════════════════════════════════════════════════════════════════
     //  STEP 5 — MOVE to destination (above drop, then lower)
     // ═══════════════════════════════════════════════════════════════════════
+    // Re-publish vacuum ON to ensure the fixed joint is still active
+    {
+      std_msgs::msg::Bool vmsg;
+      vmsg.data = true;
+      for (int i = 0; i < 5; ++i) {
+        vacuum_gripper_pub_->publish(vmsg);
+        rclcpp::sleep_for(std::chrono::milliseconds(50));
+      }
+    }
     RCLCPP_INFO(this->get_logger(), "  STEP 5a — transit above destination...");
     move_group_->setMaxVelocityScalingFactor(0.3);
     move_group_->setMaxAccelerationScalingFactor(0.3);
@@ -385,8 +396,8 @@ private:
       return;
     }
 
-    // Lower to placement height
-    RCLCPP_INFO(this->get_logger(), "  STEP 5b — lowering to place...");
+    // Lower to placement height — Cartesian first to stay perfectly level
+    RCLCPP_INFO(this->get_logger(), "  STEP 5b — lowering to place (Cartesian)...");
     bool lowered = cartesian_descend(drop_x, drop_y, z_alta_, z_presa_, drop_yaw);
     if (!lowered) {
       RCLCPP_WARN(this->get_logger(), "    Cartesian lower failed, trying IK...");
@@ -639,98 +650,116 @@ private:
     return false;
   }
 
+  // ── Helper: plan and execute a single finger position target ─────────
+  //   Used by muovi_pinza() for the two-stage close pattern that matches
+  //   the reference project's adaptive_stop behaviour.
+  bool move_fingers_to(double target_pos)
+  {
+    if (!hand_group_) return false;
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+      try {
+        const auto *jmg =
+            hand_group_->getCurrentState(10)->getJointModelGroup("panda_gripper");
+        auto cur_state = hand_group_->getCurrentState(10);
+        std::vector<double> positions;
+        cur_state->copyJointGroupPositions(jmg, positions);
+
+        RCLCPP_INFO(this->get_logger(),
+            "GRIPPER: current [%.4f, %.4f] \u2192 target %.4f (attempt %d)",
+            positions.size() > 0 ? positions[0] : -1.0,
+            positions.size() > 1 ? positions[1] : -1.0,
+            target_pos, attempt);
+
+        if (positions.size() >= 2) {
+          positions[0] = target_pos;
+          positions[1] = target_pos;
+        }
+        hand_group_->setJointValueTarget(positions);
+
+        moveit::planning_interface::MoveGroupInterface::Plan plan;
+        if (hand_group_->plan(plan) ==
+            moveit::planning_interface::MoveItErrorCode::SUCCESS) {
+          auto res = hand_group_->execute(plan);
+          if (res == moveit::planning_interface::MoveItErrorCode::SUCCESS) {
+            RCLCPP_INFO(this->get_logger(),
+                "GRIPPER: finger move OK (attempt %d)", attempt);
+            return true;
+          }
+          RCLCPP_WARN(this->get_logger(),
+              "GRIPPER: exec failed (%d), attempt %d", res.val, attempt);
+        } else {
+          RCLCPP_WARN(this->get_logger(),
+              "GRIPPER: plan failed, attempt %d", attempt);
+        }
+        rclcpp::sleep_for(std::chrono::milliseconds(500));
+      } catch (const std::exception &e) {
+        RCLCPP_ERROR(this->get_logger(),
+            "GRIPPER: exception attempt %d: %s", attempt, e.what());
+        rclcpp::sleep_for(std::chrono::milliseconds(500));
+      }
+    }
+    RCLCPP_ERROR(this->get_logger(),
+        "GRIPPER: ALL attempts failed for target %.4f!", target_pos);
+    return false;
+  }
+
   void muovi_pinza(const std::string &command)
   {
     bool is_close = (command == "close");
     RCLCPP_INFO(this->get_logger(), "GRIPPER: %s  (simulate=%s)",
                 command.c_str(), simulate_gripper_ ? "true" : "false");
 
-    // ── 1. Move finger joints via MoveIt hand_group_ ────────────────────
-    //   This mirrors the IFRA framework's moveG_action: get current state,
-    //   copy joint positions, set both finger values, plan & execute.
-    //   MoveIt routes through GripperCommand to the separate
-    //   panda_handleft_controller / panda_handright_controller.
+    // ── For CLOSE: activate vacuum gripper FIRST ─────────────────────────
+    //   The vacuum plugin on panda_leftfinger creates a fixed joint to the
+    //   nearest object within max_distance (0.05 m).  We must lock the piece
+    //   BEFORE fingers move, so the closing motion doesn't push it away.
+    //   For OPEN: deactivate vacuum first, then open fingers.
+    {
+      std_msgs::msg::Bool vacuum_msg;
+      vacuum_msg.data = is_close;
+      for (int i = 0; i < 5; ++i) {
+        vacuum_gripper_pub_->publish(vacuum_msg);
+        rclcpp::sleep_for(std::chrono::milliseconds(50));
+      }
+      // If closing, give vacuum time to create the fixed joint (Gazebo plugin latency)
+      if (is_close) {
+        rclcpp::sleep_for(std::chrono::milliseconds(1000));
+      }
+    }
+
+    // ── Move finger joints via MoveIt hand_group_ ────────────────────────
+    //   Reference project (Robot-Domino-Artist) uses two-stage closing:
+    //     gripper_width(width=0.01, speed=0.05) → detect contact (0.6 s stable)
+    //     → second close at last_width − 0.001 (tighten)
+    //   We replicate:  Stage 1 = 0.01/finger (soft approach)
+    //                   Stage 2 = 0.005/finger (tighten, matching ref total=0.01)
     if (!simulate_gripper_ && hand_group_) {
-      // Finger joint values (per-finger):
-      //   Close: 0.01 each → total gap 0.02 m (matches reference toggle_gripper)
-      //          Reference MoveIt: fer_finger_joint1=0.01, fer_finger_joint2=0.01
-      //          Reference hardware: gripper_width(0.01) → 0.005/finger
-      //          We use the MoveIt values since we're in Gazebo simulation.
-      //   Open:  0.03 each → total gap 0.06 m (matches reference domino_open_value)
-      double target_pos = is_close ? 0.01 : 0.03;
-
-      bool finger_ok = false;
-      for (int attempt = 1; attempt <= 3 && !finger_ok; ++attempt) {
-        try {
-          // Get current gripper state (exactly as IFRA moveG_action does)
-          const auto *joint_model_group =
-              hand_group_->getCurrentState(10)->getJointModelGroup("panda_gripper");
-
-          moveit::core::RobotStatePtr current_state = hand_group_->getCurrentState(10);
-          std::vector<double> joint_positions;
-          current_state->copyJointGroupPositions(joint_model_group, joint_positions);
-
-          RCLCPP_INFO(this->get_logger(),
-              "GRIPPER: current positions [%.4f, %.4f], target %.4f (attempt %d)",
-              joint_positions.size() > 0 ? joint_positions[0] : -1.0,
-              joint_positions.size() > 1 ? joint_positions[1] : -1.0,
-              target_pos, attempt);
-
-          // Set BOTH finger joints to the target value
-          if (joint_positions.size() >= 2) {
-            joint_positions[0] = target_pos;
-            joint_positions[1] = target_pos;
-          }
-          hand_group_->setJointValueTarget(joint_positions);
-
-          // Plan and execute
-          moveit::planning_interface::MoveGroupInterface::Plan plan;
-          bool planned = (hand_group_->plan(plan) ==
-                          moveit::planning_interface::MoveItErrorCode::SUCCESS);
-
-          if (planned) {
-            RCLCPP_INFO(this->get_logger(), "GRIPPER: plan succeeded, executing...");
-            auto exec_result = hand_group_->execute(plan);
-            if (exec_result == moveit::planning_interface::MoveItErrorCode::SUCCESS) {
-              finger_ok = true;
-              RCLCPP_INFO(this->get_logger(), "GRIPPER: move executed successfully (attempt %d)", attempt);
-            } else {
-              RCLCPP_WARN(this->get_logger(),
-                  "GRIPPER: execution failed (code %d), attempt %d",
-                  exec_result.val, attempt);
-            }
-          } else {
-            RCLCPP_WARN(this->get_logger(), "GRIPPER: planning failed, attempt %d", attempt);
-          }
-
-          if (!finger_ok) {
-            rclcpp::sleep_for(std::chrono::milliseconds(500));
-          }
-        } catch (const std::exception &e) {
-          RCLCPP_ERROR(this->get_logger(), "GRIPPER: exception on attempt %d: %s", attempt, e.what());
-          rclcpp::sleep_for(std::chrono::milliseconds(500));
-        }
+      if (is_close) {
+        // Stage 1: Soft close to 0.01/finger — gentle approach to piece
+        RCLCPP_INFO(this->get_logger(), "GRIPPER: stage 1 — soft close to 0.01/finger...");
+        move_fingers_to(0.01);
+        // Let physics settle (reference waits for width-stable > 0.6 s)
+        rclcpp::sleep_for(std::chrono::milliseconds(1500));
+        // Stage 2: Tighten to 0.005/finger — squeeze (ref: last_width − 0.001)
+        RCLCPP_INFO(this->get_logger(), "GRIPPER: stage 2 — tightening to 0.005/finger...");
+        move_fingers_to(0.005);
+      } else {
+        // Open: single stage to 0.03/finger (total 0.06 m, matches reference)
+        move_fingers_to(0.03);
       }
-
-      if (!finger_ok) {
-        RCLCPP_ERROR(this->get_logger(), "GRIPPER: ALL finger move attempts failed!");
-      }
-      // Give the controller time to settle (reference waits 2s)
-      rclcpp::sleep_for(std::chrono::milliseconds(1500));
+      rclcpp::sleep_for(std::chrono::milliseconds(1000));
     } else {
       rclcpp::sleep_for(std::chrono::milliseconds(500));
     }
 
-    // ── 2. Activate / deactivate vacuum gripper in Gazebo ──────────────
-    //   The Panda URDF loads libgazebo_ros_vacuum_gripper.so on
-    //   panda_leftfinger.  Publishing true creates a fixed joint to the
-    //   nearest object within max_distance (0.05 m).
-    //   Publish multiple times to ensure delivery in a laggy sim.
-    std_msgs::msg::Bool vacuum_msg;
-    vacuum_msg.data = is_close;
-    for (int i = 0; i < 3; ++i) {
-      vacuum_gripper_pub_->publish(vacuum_msg);
-      rclcpp::sleep_for(std::chrono::milliseconds(100));
+    // ── After close: re-publish vacuum to ensure it's still locked ────────
+    if (is_close) {
+      std_msgs::msg::Bool vacuum_msg;
+      vacuum_msg.data = true;
+      for (int i = 0; i < 5; ++i) {
+        vacuum_gripper_pub_->publish(vacuum_msg);
+        rclcpp::sleep_for(std::chrono::milliseconds(50));
+      }
     }
   }
 
