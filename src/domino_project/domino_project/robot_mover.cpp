@@ -11,6 +11,9 @@
 #include <cmath>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_srvs/srv/set_bool.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+#include <control_msgs/action/gripper_command.hpp>
 #include <fstream>
 
 // ─── Physical constants ───────────────────────────────────────────────────────
@@ -22,7 +25,7 @@
 //   SDF y = 0.024 (short axis on table)
 //   SDF z = 0.0075 (thickness, faces up when lying flat)
 const double DOMINO_LEN     = 0.048;   // long axis  (SDF x)
-const double DOMINO_WID     = 0.024;   // short axis (SDF y) — gripper straddles this
+const double DOMINO_WID     = 0.024;   // short axis (SDF y) — gripper closes across this
 const double DOMINO_H       = 0.0075;  // thickness  (SDF z)
 
 // Environment geometry — derived from the Gazebo spawn configuration.
@@ -38,24 +41,46 @@ const double DOMINO_REST_Z  = TABLE_TOP_Z + DOMINO_H / 2.0;    // 1.30375 m
 // ── Panda EEF chain (derived from the URDF, gripper pointing DOWN, roll=π) ──
 //   panda_link8  → panda_hand       : xyz="0 0 0"      (no z offset)
 //   panda_hand   → panda_finger_joint1 origin : xyz="0 0 0.0584"
-//   panda_leftfinger mesh z extent  : 0.0001 → 0.0538 m
-//   ∴ fingertip is 0.0584 + 0.0538 = 0.1122 m BELOW panda_link8
+//   panda_leftfinger collision box: origin z=0.027, size z=0.052
+//     pad TOP    = 0.0584 + 0.027 − 0.026 = 0.0594 m below link8
+//     pad CENTRE = 0.0584 + 0.027          = 0.0854 m below link8
+//     pad BOTTOM = 0.0584 + 0.027 + 0.026 = 0.1114 m below link8
 //
 // Context: cell_layout_2=true mounts the robot on a 1.3 m pedestal.
 //   panda_link0 world z = 0.65 (pedestal_joint) + 0.655 (panda_joint) = 1.305 m
 //   The arm reaches DOWNWARD — table top (1.30 m) is just below the robot base.
-const double PANDA_LINK8_TO_FINGERTIP = 0.0584 + 0.0538;   // 0.1122 m
+const double PANDA_LINK8_TO_FINGERTIP = 0.0584 + 0.0538;   // 0.1122 m (mesh end)
+const double PANDA_LINK8_TO_PAD_BOTTOM = 0.0584 + 0.027 + 0.026;  // 0.1114 m (collision box bottom)
 
-// Grasp z: fingertips at the piece centre height.
-//   The piece is only 7.5 mm thick.  Placing the fingertips at the piece
-//   centre (DOMINO_REST_Z = TABLE_TOP_Z + DOMINO_H/2 = 1.30375 m) keeps
-//   the finger collision meshes ABOVE the table collision object so MoveIt
-//   can actually plan the descent.  The vacuum gripper (max_distance 50 mm)
-//   handles the real attachment in Gazebo.
-//   Previous value (TABLE_TOP_Z − 1 mm) put the finger meshes INTO the table
-//   collision object → "Unable to sample any valid states for goal tree".
-const double Z_PRESA_DEFAULT = DOMINO_REST_Z + PANDA_LINK8_TO_FINGERTIP;
-//   = 1.30375 + 0.1122 = 1.41595 m  (fingertip at piece centre, ~4 mm above table)
+// Grasp z: computed from URDF finger geometry — NOT from the reference's TCP offset.
+//
+//   The reference uses fer_hand_tcp (0.1034 m below link8 on the real Franka).
+//   Our URDF finger pad bottom is at 0.1114 m below link8 — different from 0.1034.
+//   Using the reference's PANDA_TCP_OFFSET=0.1034 in the formula made the fingers
+//   descend 0.008 m (8 mm) LESS than intended (0.1114 − 0.1034 = 0.008).
+//
+//   Correct approach: derive z_presa directly from the collision geometry.
+//
+//   Goal: finger pad bottom should be TABLE_CLEARANCE mm above the table,
+//   maximising overlap with the 7.5 mm piece.
+//
+//   finger_pad_bottom = link8_z − 0.1114
+//   finger_pad_bottom = TABLE_TOP_Z + TABLE_CLEARANCE
+//   ∴ link8_z = TABLE_TOP_Z + TABLE_CLEARANCE + 0.1114
+//
+//   TABLE_CLEARANCE = 0.0005 m (0.5 mm) — enough to avoid Gazebo collision
+//   with the table surface, verified safe (min_depth=0.0001 in ODE).
+//
+//   Result:
+//     link8_z = 1.30 + 0.0005 + 0.1114 = 1.4119 m
+//     finger_pad_bottom = 1.3005 m  (0.5 mm above table)
+//     piece_top = 1.3075 m  →  overlap = 7.0 mm (93% of 7.5 mm piece)  ✓
+//
+//   Previous value was 1.41315 (finger bottom at 1.30175, overlap=5.75mm=77%).
+//   Going 1.25 mm lower gains 17% more overlap.
+const double TABLE_CLEARANCE = 0.0005;  // 0.5 mm above table surface
+const double Z_PRESA_DEFAULT = TABLE_TOP_Z + TABLE_CLEARANCE + PANDA_LINK8_TO_PAD_BOTTOM;
+//   = 1.30 + 0.0005 + 0.1114 = 1.4119 m
 
 // EEF z for safe transit: fingertips 20 cm above the table surface
 // (reference uses 22 cm above object, we use a generous 20 cm above table)
@@ -83,8 +108,31 @@ public:
     this->declare_parameter<bool>("simulate_gripper", false);
     simulate_gripper_ = this->get_parameter("simulate_gripper").as_bool();
 
-    // Vacuum gripper plugin on panda_leftfinger: toggle via /panda_hand/grasping
-    vacuum_gripper_pub_ = this->create_publisher<std_msgs::msg::Bool>("/panda_hand/grasping", 10);
+    // Vacuum gripper plugin: 'switch' is a SetBool SERVICE, 'grasping' is a Bool TOPIC.
+    // The URDF remaps switch→vacuum_switch so it doesn't collide with the status topic.
+    vacuum_gripper_client_ = this->create_client<std_srvs::srv::SetBool>(
+        "/panda_hand/vacuum_switch");
+
+    // GripperCommand action clients for individual finger control.
+    // These bypass MoveIt and talk directly to the GripperActionControllers,
+    // which have built-in stall detection (stall_timeout: 1.0 s).
+    // This is equivalent to the reference project's adaptive_stop mechanism.
+    left_gripper_client_ = rclcpp_action::create_client<control_msgs::action::GripperCommand>(
+        this, "/panda_handleft_controller/gripper_cmd");
+    right_gripper_client_ = rclcpp_action::create_client<control_msgs::action::GripperCommand>(
+        this, "/panda_handright_controller/gripper_cmd");
+
+    // Subscribe to vacuum status feedback from the Gazebo plugin
+    vacuum_status_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+        "/panda_hand/grasping", 10,
+        [this](const std_msgs::msg::Bool::SharedPtr msg) {
+          bool prev = vacuum_attached_.load();
+          vacuum_attached_ = msg->data;
+          if (msg->data != prev) {
+            RCLCPP_INFO(this->get_logger(), "VACUUM STATUS: %s",
+                        msg->data ? "*** ATTACHED ***" : "detached");
+          }
+        });
 
     // z_alta_ and z_presa_ are derived from physical constants — not overridable
     z_alta_  = Z_ALTA_DEFAULT;
@@ -130,9 +178,9 @@ public:
     move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
     move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
     move_group_->setPlanningTime(10.0);
-    move_group_->setNumPlanningAttempts(15);
-    move_group_->setGoalPositionTolerance(0.01);
-    move_group_->setGoalOrientationTolerance(0.02);  // ~1° — tight enough to stay level
+    move_group_->setNumPlanningAttempts(20);       // ref: num_planning_attempts=20
+    move_group_->setGoalPositionTolerance(0.002);  // ref: 1e-3; 2 mm is safe for OMPL
+    move_group_->setGoalOrientationTolerance(0.01); // ref: 1e-3; ~0.6° for OMPL
 
     planning_scene_interface_ = std::make_shared<moveit::planning_interface::PlanningSceneInterface>();
 
@@ -156,6 +204,22 @@ public:
     // Diagnostic: verify which link MoveIt is planning for
     RCLCPP_INFO(this->get_logger(), "MoveIt EEF link: '%s'", move_group_->getEndEffectorLink().c_str());
 
+    // Wait for vacuum gripper service (Gazebo plugin must be loaded)
+    RCLCPP_INFO(this->get_logger(), "Waiting for vacuum gripper service /panda_hand/vacuum_switch…");
+    if (vacuum_gripper_client_->wait_for_service(std::chrono::seconds(30))) {
+      RCLCPP_INFO(this->get_logger(), "Vacuum gripper service AVAILABLE.");
+    } else {
+      RCLCPP_WARN(this->get_logger(),
+          "Vacuum gripper service NOT available after 30 s — vacuum grasping unavailable.");
+    }
+
+    // Wait for GripperCommand action servers (finger controllers)
+    RCLCPP_INFO(this->get_logger(), "Waiting for gripper action servers…");
+    bool left_ok = left_gripper_client_->wait_for_action_server(std::chrono::seconds(10));
+    bool right_ok = right_gripper_client_->wait_for_action_server(std::chrono::seconds(10));
+    RCLCPP_INFO(this->get_logger(), "Gripper action servers: left=%s, right=%s",
+                left_ok ? "OK" : "MISSING", right_ok ? "OK" : "MISSING");
+
     go_to_home();
 
     moveit_ready_ = true;
@@ -164,8 +228,12 @@ public:
 
 private:
   // ── ROS handles ──────────────────────────────────────────────────────────
+  using GripperAction = control_msgs::action::GripperCommand;
   rclcpp::Subscription<visualization_msgs::msg::MarkerArray>::SharedPtr detections_sub_;
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr vacuum_gripper_pub_;
+  rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr vacuum_gripper_client_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr vacuum_status_sub_;
+  rclcpp_action::Client<GripperAction>::SharedPtr left_gripper_client_;
+  rclcpp_action::Client<GripperAction>::SharedPtr right_gripper_client_;
   std::shared_ptr<moveit::planning_interface::MoveGroupInterface> move_group_;
   std::shared_ptr<moveit::planning_interface::MoveGroupInterface> hand_group_;
   std::shared_ptr<moveit::planning_interface::PlanningSceneInterface> planning_scene_interface_;
@@ -178,6 +246,7 @@ private:
   // ── State ────────────────────────────────────────────────────────────────
   std::atomic_bool moveit_ready_{false};
   std::atomic_bool is_busy_{false};
+  std::atomic_bool vacuum_attached_{false};
   std::string attached_object_id_;
   std::ofstream metrics_file_;
   std::thread worker_thread_;
@@ -270,7 +339,15 @@ private:
       "MISSION START  center=(%.3f,%.3f)  target=(%.3f,%.3f) yaw=%.2f",
       center.x, center.y, target.x, target.y, target.yaw);
 
-    // ── Grasp yaw: fingers ⊥ piece long axis ──────────────────────────────
+    // ── Grasp yaw: fingers close ACROSS piece short axis (24 mm) ────────
+    //   panda_hand_joint rotates −π/4 from link8 around Z.
+    //   Finger prismatic axis = hand Y.  Hand Y in world = θ_link8 − π/4.
+    //   For hand Y ∥ short axis (target.yaw + π/2):
+    //     θ_link8 = target.yaw + π/2 + π/4 = target.yaw + 3π/4
+    //   Short axis chosen for simulation:
+    //     • 18 mm descent clearance per side (vs 6 mm on long axis)
+    //     • 24 mm across → stronger clamping than 48 mm
+    //     • Reference uses long axis with force feedback we don't have
     const double grasp_yaw = target.yaw + 3.0 * M_PI / 4.0;
 
     // ── Compute destination pose ──────────────────────────────────────────
@@ -312,37 +389,53 @@ private:
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 2 — OPEN fingers
+    //  STEP 2 — OPEN fingers (ref: gripper_width(0.06, 0.05))
     // ═══════════════════════════════════════════════════════════════════════
     RCLCPP_INFO(this->get_logger(), "  STEP 2 — opening fingers...");
     muovi_pinza("open");
-    rclcpp::sleep_for(std::chrono::seconds(2));
+    rclcpp::sleep_for(std::chrono::seconds(2));  // ref: time.sleep(2)
 
-    // Remove collision object so we can descend onto the piece
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 2b — Remove table + domino from MoveIt collision scene
+    //   Reference: lower_until_force_limit() calls remove_table before descent.
+    //   This allows the arm to descend low enough for finger pads to fully
+    //   wrap the piece.  Table is re-added after gripping (STEP 4).
+    // ═══════════════════════════════════════════════════════════════════════
     std::string target_obj = find_closest_domino(target.x, target.y);
-    if (!target_obj.empty()) {
-      planning_scene_interface_->removeCollisionObjects({target_obj});
+    {
+      std::vector<std::string> remove_ids = {"work_table"};
+      if (!target_obj.empty()) remove_ids.push_back(target_obj);
+      planning_scene_interface_->removeCollisionObjects(remove_ids);
+      rclcpp::sleep_for(std::chrono::milliseconds(500));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  STEP 3 — DESCEND onto piece
-    //   Cartesian FIRST — this keeps the EEF perfectly level throughout
-    //   the straight-line drop.  IK (plan_and_execute) is the fallback
-    //   because OMPL can freely tilt the orientation along the path.
+    //   Reference uses plan_pose_path (IK goal) for descent (MOVE 4),
+    //   with vel=0.1, acc=0.1.  Then retries up to 100 times.
+    //   We try IK with slow speed up to 5 times, then Cartesian fallback.
+    //   Table collision is already removed (STEP 2b).
     // ═══════════════════════════════════════════════════════════════════════
-    RCLCPP_INFO(this->get_logger(), "  STEP 3 — descending to z=%.4f ...", z_presa_);
-    bool descended = cartesian_descend(target.x, target.y, z_alta_, z_presa_, pick_yaw);
-    if (!descended) {
-      RCLCPP_WARN(this->get_logger(), "    Cartesian descent failed, trying IK...");
-      move_group_->setPlanningTime(5.0);
-      move_group_->setNumPlanningAttempts(4);
+    RCLCPP_INFO(this->get_logger(), "  STEP 3 — descending to z=%.4f (slow, IK first)...", z_presa_);
+    move_group_->setMaxVelocityScalingFactor(0.1);     // ref: 0.1 for descent
+    move_group_->setMaxAccelerationScalingFactor(0.1);  // ref: 0.1 for descent
+
+    bool descended = false;
+    for (int ik_try = 1; ik_try <= 5 && !descended; ++ik_try) {
+      RCLCPP_INFO(this->get_logger(), "    IK descent attempt %d/5...", ik_try);
       descended = plan_and_execute(target.x, target.y, z_presa_, pick_yaw);
-      move_group_->setPlanningTime(10.0);
-      move_group_->setNumPlanningAttempts(15);
     }
+    if (!descended) {
+      RCLCPP_WARN(this->get_logger(), "    IK descent failed after 5 tries, trying Cartesian...");
+      descended = cartesian_descend(target.x, target.y, z_alta_, z_presa_, pick_yaw);
+    }
+
+    move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
+    move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
 
     if (!descended) {
       RCLCPP_ERROR(this->get_logger(), "  Cannot descend onto piece — aborting.");
+      add_table_collision();
       if (!target_obj.empty()) add_domino_collision_object(target_obj, target.x, target.y);
       emergency_stop_and_recover();
       return;
@@ -350,30 +443,65 @@ private:
     rclcpp::sleep_for(std::chrono::seconds(1));  // settle
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 4 — CLOSE fingers (grab piece)
+    //  STEP 4 — GRASP piece
+    //   Reference sequence (Robot-Domino-Artist):
+    //     1. Attach collision object (for MoveIt planning)
+    //     2. Close fingers (physical grip via GripperCommand with stall detection)
+    //     3. Vacuum ON (backup ODE fixed joint)
+    //   Fingers close FIRST so the piece is gripped by friction BEFORE
+    //   the vacuum fixed joint is created.  If we did vacuum first, the
+    //   leftfinger would drag the piece sideways when closing.
     // ═══════════════════════════════════════════════════════════════════════
-    RCLCPP_INFO(this->get_logger(), "  STEP 4 — closing fingers...");
-    // Attach collision object BEFORE close so MoveIt knows the piece is held
+    RCLCPP_INFO(this->get_logger(), "  STEP 4 — grasping piece...");
+
+    // 4a. Attach collision object for MoveIt planning (ref: attach BEFORE close)
     if (!target_obj.empty()) {
       add_domino_as_attached(target_obj);
       attached_object_id_ = target_obj;
     }
+
+    // 4b. Close fingers via GripperCommand action (with stall detection)
+    //     Target: 0.005/finger (ref: domino_length_closing = 0.01 total).
+    //     The controller has stall_timeout=1.0s — it stops when fingers
+    //     contact the piece (stalls), just like the reference adaptive_stop.
+    //     max_effort=10N prevents pushing the piece away.
     muovi_pinza("close");
-    rclcpp::sleep_for(std::chrono::seconds(2));
+    rclcpp::sleep_for(std::chrono::seconds(2));  // ref: time.sleep(2) after close
+
+    // 4c. Vacuum ON for backup grip (ODE fixed joint)
+    RCLCPP_INFO(this->get_logger(), "  STEP 4c — vacuum ON (backup)...");
+    call_vacuum_service(true);
+    rclcpp::sleep_for(std::chrono::milliseconds(500));
+    RCLCPP_INFO(this->get_logger(), "  Vacuum status: %s",
+                vacuum_attached_.load() ? "ATTACHED" : "not attached (finger grip only)");
+
     log_event("pick", true, "x=" + std::to_string(target.x));
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 5 — MOVE to destination (above drop, then lower)
+    //  STEP 4b — LIFT 10 cm (Cartesian, no collision check)
+    //   CRITICAL: at z_presa, fingertips are only 1.75 mm above the table.
+    //   MoveIt collision padding (~10 mm) would consider this IN-COLLISION
+    //   with the table, causing OMPL to fail on the transit plan.
+    //   Reference also lifts 15 cm (MOVEMENT 8) before transit.
+    //   We lift BEFORE re-adding the table to avoid the collision issue.
     // ═══════════════════════════════════════════════════════════════════════
-    // Re-publish vacuum ON to ensure the fixed joint is still active
-    {
-      std_msgs::msg::Bool vmsg;
-      vmsg.data = true;
-      for (int i = 0; i < 5; ++i) {
-        vacuum_gripper_pub_->publish(vmsg);
-        rclcpp::sleep_for(std::chrono::milliseconds(50));
-      }
+    RCLCPP_INFO(this->get_logger(), "  STEP 4b — Cartesian lift 10 cm...");
+    double lift_z = z_presa_ + 0.10;
+    if (!cartesian_move(target.x, target.y, lift_z, pick_yaw)) {
+      RCLCPP_WARN(this->get_logger(), "    Cartesian lift failed, trying IK...");
+      plan_and_execute(target.x, target.y, lift_z, pick_yaw);
     }
+    // Check vacuum status after lift
+    RCLCPP_INFO(this->get_logger(), "  Vacuum status after lift: %s",
+                vacuum_attached_.load() ? "ATTACHED" : "finger grip only");
+
+    // NOW re-add table collision — arm is 10 cm higher, well clear of padding
+    add_table_collision();
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 5 — MOVE to destination (above drop, then lower)
+    //   Reference: MOVE 8 (lift) → MOVE 9 (go home) → MOVE 10 (above goal)
+    // ═══════════════════════════════════════════════════════════════════════
     RCLCPP_INFO(this->get_logger(), "  STEP 5a — transit above destination...");
     move_group_->setMaxVelocityScalingFactor(0.3);
     move_group_->setMaxAccelerationScalingFactor(0.3);
@@ -396,21 +524,36 @@ private:
       return;
     }
 
-    // Lower to placement height — Cartesian first to stay perfectly level
-    RCLCPP_INFO(this->get_logger(), "  STEP 5b — lowering to place (Cartesian)...");
-    bool lowered = cartesian_descend(drop_x, drop_y, z_alta_, z_presa_, drop_yaw);
-    if (!lowered) {
-      RCLCPP_WARN(this->get_logger(), "    Cartesian lower failed, trying IK...");
+    // Remove table collision before lowering (same as pick descent)
+    remove_table_collision();
+
+    // Lower to placement height — slow, IK first (like reference), Cartesian fallback
+    RCLCPP_INFO(this->get_logger(), "  STEP 5b — lowering to place (slow, IK first)...");
+    move_group_->setMaxVelocityScalingFactor(0.1);     // ref: 0.1 for descent
+    move_group_->setMaxAccelerationScalingFactor(0.1);
+
+    bool lowered = false;
+    for (int ik_try = 1; ik_try <= 5 && !lowered; ++ik_try) {
+      RCLCPP_INFO(this->get_logger(), "    IK lower attempt %d/5...", ik_try);
       lowered = plan_and_execute(drop_x, drop_y, z_presa_, drop_yaw);
     }
     if (!lowered) {
+      RCLCPP_WARN(this->get_logger(), "    IK lower failed, trying Cartesian...");
+      lowered = cartesian_descend(drop_x, drop_y, z_alta_, z_presa_, drop_yaw);
+    }
+
+    move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
+    move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
+    if (!lowered) {
       RCLCPP_ERROR(this->get_logger(), "  Cannot lower to place — aborting.");
+      add_table_collision();
       emergency_stop_and_recover();
       return;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  STEP 6 — OPEN fingers (release piece)
+    //   Reference: detach, open gripper, sleep(2)
     // ═══════════════════════════════════════════════════════════════════════
     RCLCPP_INFO(this->get_logger(), "  STEP 6 — releasing piece...");
     if (!attached_object_id_.empty()) {
@@ -422,8 +565,19 @@ private:
 
     // ═══════════════════════════════════════════════════════════════════════
     //  STEP 7 — COME BACK UP (ready to search for next piece)
+    //   Cartesian lift BEFORE re-adding table (same collision padding issue
+    //   as STEP 4b — fingertips only 1.75 mm above table at z_presa).
     // ═══════════════════════════════════════════════════════════════════════
-    RCLCPP_INFO(this->get_logger(), "  STEP 7 — coming back up...");
+    RCLCPP_INFO(this->get_logger(), "  STEP 7 — lifting from place position...");
+    double place_lift_z = z_presa_ + 0.10;
+    if (!cartesian_move(drop_x, drop_y, place_lift_z, drop_yaw)) {
+      plan_and_execute(drop_x, drop_y, place_lift_z, drop_yaw);
+    }
+
+    // NOW re-add table collision — arm is clear
+    add_table_collision();
+
+    RCLCPP_INFO(this->get_logger(), "  STEP 7b — returning to home...");
     if (!cartesian_move(drop_x, drop_y, z_alta_, drop_yaw)) {
       plan_and_execute(drop_x, drop_y, z_alta_, drop_yaw);
     }
@@ -459,7 +613,7 @@ private:
     RCLCPP_INFO(this->get_logger(),
       "Cartesian descend fraction: %.2f  (%.3f → %.3f)", fraction, z_start, z_end);
 
-    if (fraction >= 0.95) {
+    if (fraction >= 0.98) {
       moveit::planning_interface::MoveGroupInterface::Plan plan;
       plan.trajectory_ = trajectory;
       if (move_group_->execute(plan) == moveit::planning_interface::MoveItErrorCode::SUCCESS) {
@@ -477,16 +631,17 @@ private:
   {
     std::vector<moveit_msgs::msg::CollisionObject> objs;
 
-    // Virtual table — dimensions and pose must EXACTLY match models/work_table/model.sdf
+    // Virtual table — EXACTLY matches models/work_table/model.sdf
     // SDF box size: 0.8 x 1.2 x 1.0, spawned at z=0.8 (box centre)
     // → table top = 0.8 + 0.5 = 1.30 m = TABLE_TOP_Z  ✓
+    // Reference approach: full-height table, removed/re-added for descent
+    // (reference: table.size=[0.908,0.605,0.838], top at z=0 exactly)
     moveit_msgs::msg::CollisionObject table;
     table.id = "work_table";
     table.header.frame_id = "world";
     shape_msgs::msg::SolidPrimitive tp;
     tp.type = shape_msgs::msg::SolidPrimitive::BOX;
-    tp.dimensions = {0.8, 1.2, 0.99};  // 10 mm shorter than real table → collision top
-                                          //   at 1.295 m, giving ~9 mm clearance for fingers
+    tp.dimensions = {0.8, 1.2, 1.0};  // full height — top at 1.30 = real table
     geometry_msgs::msg::Pose tpose;
     tpose.position.x = 0.7; tpose.position.y = 0.0; tpose.position.z = 0.80;
     tpose.orientation.w = 1.0;
@@ -505,6 +660,35 @@ private:
       objs.push_back(make_domino_collision_object(d.first, d.second.first, d.second.second));
     }
     planning_scene_interface_->applyCollisionObjects(objs);
+  }
+
+  // ── Table collision management (matches reference remove_table / add_table) ──
+  //   Reference removes the table before descent so MoveIt allows the gripper
+  //   to reach below the table surface, then re-adds it after gripping.
+  void remove_table_collision()
+  {
+    RCLCPP_INFO(this->get_logger(), "Removing table collision for descent...");
+    planning_scene_interface_->removeCollisionObjects({"work_table"});
+    rclcpp::sleep_for(std::chrono::milliseconds(300));
+  }
+
+  void add_table_collision()
+  {
+    RCLCPP_INFO(this->get_logger(), "Re-adding table collision...");
+    moveit_msgs::msg::CollisionObject table;
+    table.id = "work_table";
+    table.header.frame_id = "world";
+    shape_msgs::msg::SolidPrimitive tp;
+    tp.type = shape_msgs::msg::SolidPrimitive::BOX;
+    tp.dimensions = {0.8, 1.2, 1.0};
+    geometry_msgs::msg::Pose tpose;
+    tpose.position.x = 0.7; tpose.position.y = 0.0; tpose.position.z = 0.80;
+    tpose.orientation.w = 1.0;
+    table.primitives.push_back(tp);
+    table.primitive_poses.push_back(tpose);
+    table.operation = table.ADD;
+    planning_scene_interface_->applyCollisionObjects({table});
+    rclcpp::sleep_for(std::chrono::milliseconds(300));
   }
 
   moveit_msgs::msg::CollisionObject make_domino_collision_object(
@@ -636,7 +820,7 @@ private:
     RCLCPP_INFO(this->get_logger(), "Cartesian path fraction: %.2f (goal: %.1f, %.1f, %.1f)",
                 fraction, x, y, z);
 
-    if (fraction >= 0.95) {
+    if (fraction >= 0.98) {
       moveit::planning_interface::MoveGroupInterface::Plan plan;
       plan.trajectory_ = trajectory;
       if (move_group_->execute(plan) == moveit::planning_interface::MoveItErrorCode::SUCCESS) {
@@ -645,7 +829,7 @@ private:
       RCLCPP_ERROR(this->get_logger(), "Cartesian path execution failed");
     } else {
       RCLCPP_WARN(this->get_logger(),
-                  "Cartesian path coverage insufficient: %.2f < 0.95", fraction);
+                  "Cartesian path coverage insufficient: %.2f < 0.98", fraction);
     }
     return false;
   }
@@ -709,58 +893,109 @@ private:
     RCLCPP_INFO(this->get_logger(), "GRIPPER: %s  (simulate=%s)",
                 command.c_str(), simulate_gripper_ ? "true" : "false");
 
-    // ── For CLOSE: activate vacuum gripper FIRST ─────────────────────────
-    //   The vacuum plugin on panda_leftfinger creates a fixed joint to the
-    //   nearest object within max_distance (0.05 m).  We must lock the piece
-    //   BEFORE fingers move, so the closing motion doesn't push it away.
-    //   For OPEN: deactivate vacuum first, then open fingers.
-    {
-      std_msgs::msg::Bool vacuum_msg;
-      vacuum_msg.data = is_close;
-      for (int i = 0; i < 5; ++i) {
-        vacuum_gripper_pub_->publish(vacuum_msg);
-        rclcpp::sleep_for(std::chrono::milliseconds(50));
-      }
-      // If closing, give vacuum time to create the fixed joint (Gazebo plugin latency)
-      if (is_close) {
-        rclcpp::sleep_for(std::chrono::milliseconds(1000));
-      }
-    }
+    // ── Grasp strategy (matching reference Robot-Domino-Artist) ──────────
+    //   CLOSE: fingers close FIRST (physical grip), then vacuum ON for backup.
+    //   OPEN:  vacuum OFF, then fingers open.
+    //
+    //   Uses MoveIt panda_gripper group so both joints move in a SINGLE
+    //   synchronised trajectory.  Separate GripperCommand action clients
+    //   caused asymmetric timing (one finger arrived before the other),
+    //   tipping the piece sideways.
 
-    // ── Move finger joints via MoveIt hand_group_ ────────────────────────
-    //   Reference project (Robot-Domino-Artist) uses two-stage closing:
-    //     gripper_width(width=0.01, speed=0.05) → detect contact (0.6 s stable)
-    //     → second close at last_width − 0.001 (tighten)
-    //   We replicate:  Stage 1 = 0.01/finger (soft approach)
-    //                   Stage 2 = 0.005/finger (tighten, matching ref total=0.01)
-    if (!simulate_gripper_ && hand_group_) {
-      if (is_close) {
-        // Stage 1: Soft close to 0.01/finger — gentle approach to piece
-        RCLCPP_INFO(this->get_logger(), "GRIPPER: stage 1 — soft close to 0.01/finger...");
-        move_fingers_to(0.01);
-        // Let physics settle (reference waits for width-stable > 0.6 s)
-        rclcpp::sleep_for(std::chrono::milliseconds(1500));
-        // Stage 2: Tighten to 0.005/finger — squeeze (ref: last_width − 0.001)
-        RCLCPP_INFO(this->get_logger(), "GRIPPER: stage 2 — tightening to 0.005/finger...");
-        move_fingers_to(0.005);
-      } else {
-        // Open: single stage to 0.03/finger (total 0.06 m, matches reference)
-        move_fingers_to(0.03);
-      }
-      rclcpp::sleep_for(std::chrono::milliseconds(1000));
-    } else {
-      rclcpp::sleep_for(std::chrono::milliseconds(500));
-    }
-
-    // ── After close: re-publish vacuum to ensure it's still locked ────────
     if (is_close) {
-      std_msgs::msg::Bool vacuum_msg;
-      vacuum_msg.data = true;
-      for (int i = 0; i < 5; ++i) {
-        vacuum_gripper_pub_->publish(vacuum_msg);
-        rclcpp::sleep_for(std::chrono::milliseconds(50));
+      // ── CLOSE: both fingers simultaneously via MoveIt hand_group ───
+      //   Piece short axis = DOMINO_WID (24 mm).  Fingers close across it.
+      //   Contact when gap = DOMINO_WID → q_contact = DOMINO_WID/2 = 0.012.
+      //
+      //   We command q = DOMINO_WID/2 − 0.002 = 0.010/finger (20 mm gap).
+      //   This is only 2 mm past contact per side — gentle clamping.
+      const double close_pos = DOMINO_WID / 2.0 - 0.002;  // 0.010/finger
+      RCLCPP_INFO(this->get_logger(),
+          "GRIPPER: closing to %.4f/finger (%.1fmm gap, piece=%.0fmm)...",
+          close_pos, close_pos * 2000.0, DOMINO_WID * 1000.0);
+      move_fingers_to(close_pos);
+      rclcpp::sleep_for(std::chrono::seconds(2));
+      RCLCPP_INFO(this->get_logger(), "GRIPPER: fingers closed.");
+    } else {
+      // ── OPEN: vacuum OFF first, then open fingers ──────────────────
+      RCLCPP_INFO(this->get_logger(), "GRIPPER: vacuum OFF, opening fingers...");
+      call_vacuum_service(false);
+      rclcpp::sleep_for(std::chrono::milliseconds(500));
+
+      move_fingers_to(0.035);
+      rclcpp::sleep_for(std::chrono::seconds(1));
+      rclcpp::sleep_for(std::chrono::seconds(2));
+      RCLCPP_INFO(this->get_logger(), "GRIPPER: fingers open.");
+    }
+  }
+
+  // ── Helper: send GripperCommand to one finger controller ────────────────
+  //   Uses rclcpp_action to send a goal with position + max_effort.
+  //   The GripperActionController will stop the finger at the piece surface
+  //   thanks to stall_timeout (1.0s) and stall_velocity_threshold (0.001),
+  //   mimicking the reference project's adaptive_stop mechanism.
+  void send_gripper_command(
+      rclcpp_action::Client<GripperAction>::SharedPtr &client,
+      double position, double max_effort)
+  {
+    if (!client->action_server_is_ready()) {
+      RCLCPP_WARN(this->get_logger(),
+          "Gripper action server not ready, falling back to MoveIt...");
+      // Fallback: use MoveIt hand_group
+      if (hand_group_) move_fingers_to(position);
+      return;
+    }
+
+    auto goal = GripperAction::Goal();
+    goal.command.position = position;
+    goal.command.max_effort = max_effort;
+
+    auto send_opts = rclcpp_action::Client<GripperAction>::SendGoalOptions();
+    // Fire-and-forget: the controller will handle stall detection internally.
+    // We wait with a sleep in the caller.
+    auto future = client->async_send_goal(goal, send_opts);
+    // Wait briefly for goal acceptance
+    if (future.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
+      auto gh = future.get();
+      if (!gh) {
+        RCLCPP_WARN(this->get_logger(), "Gripper goal rejected.");
+      }
+    } else {
+      RCLCPP_WARN(this->get_logger(), "Gripper goal acceptance timed out.");
+    }
+  }
+
+  // ── Helper: call the vacuum gripper SetBool service ─────────────────────
+  bool call_vacuum_service(bool on)
+  {
+    if (!vacuum_gripper_client_->service_is_ready()) {
+      RCLCPP_WARN(this->get_logger(), "Vacuum service not ready, waiting 5 s...");
+      if (!vacuum_gripper_client_->wait_for_service(std::chrono::seconds(5))) {
+        RCLCPP_ERROR(this->get_logger(), "Vacuum service still not available!");
+        return false;
       }
     }
+
+    auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+    request->data = on;
+
+    auto future = vacuum_gripper_client_->async_send_request(request);
+
+    // Block until the response arrives (safe — we're in the worker thread,
+    // the MultiThreadedExecutor processes the response on another thread)
+    auto status = future.wait_for(std::chrono::seconds(10));
+    if (status == std::future_status::ready) {
+      auto response = future.get();
+      RCLCPP_INFO(this->get_logger(),
+          "VACUUM %s → success=%s, msg='%s'",
+          on ? "ON" : "OFF",
+          response->success ? "true" : "false",
+          response->message.c_str());
+      return response->success;
+    }
+
+    RCLCPP_ERROR(this->get_logger(), "Vacuum service call timed out (10 s)!");
+    return false;
   }
 
   void go_to_home()

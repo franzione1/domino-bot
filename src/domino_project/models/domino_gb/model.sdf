@@ -5,14 +5,17 @@
     <link name="link">
       <!-- Dimensions match reference project: 0.048 x 0.024 x 0.0075 m -->
       <inertial>
-        <mass>0.05</mass>
+        <!-- 0.2 kg: heavier than real (prevents finger forces blasting
+             the piece through the table before vacuum locks it). -->
+        <mass>0.2</mass>
         <inertia>
-          <ixx>2.635e-6</ixx><ixy>0</ixy><ixz>0</ixz>
-          <iyy>9.834e-6</iyy><iyz>0</iyz>
-          <izz>1.200e-5</izz>
+          <ixx>1.054e-5</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>3.934e-5</iyy><iyz>0</iyz>
+          <izz>4.800e-5</izz>
         </inertia>
       </inertial>
       <collision name="collision">
+        <max_contacts>20</max_contacts>
         <geometry>
           <box>
             <size>0.048 0.024 0.0075</size>
@@ -27,9 +30,9 @@
           </friction>
           <contact>
             <ode>
-              <kp>10000000.0</kp>
-              <kd>1.0</kd>
-              <min_depth>0.001</min_depth>
+              <kp>100000000.0</kp>
+              <kd>1000.0</kd>
+              <min_depth>0.0001</min_depth>
               <max_vel>0.1</max_vel>
             </ode>
           </contact>

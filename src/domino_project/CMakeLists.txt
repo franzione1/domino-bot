@@ -18,18 +18,24 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(moveit_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(control_msgs REQUIRED)
+find_package(rclcpp_action REQUIRED)
 
 # --- NODO C++ ---
 # Usiamo il percorso dove hai attualmente il file
 add_executable(robot_mover_cpp domino_project/robot_mover.cpp)
 ament_target_dependencies(robot_mover_cpp
   rclcpp
+  rclcpp_action
   moveit_ros_planning_interface
   geometry_msgs
   tf2_geometry_msgs
   visualization_msgs
   moveit_msgs
   std_msgs
+  std_srvs
+  control_msgs
 )
 
 # --- QUESTA È LA PARTE CHE MANCAVA! ---
