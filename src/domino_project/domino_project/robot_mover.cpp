@@ -110,8 +110,21 @@ public:
 
     // Vacuum gripper plugin: 'switch' is a SetBool SERVICE, 'grasping' is a Bool TOPIC.
     // The URDF remaps switch→vacuum_switch so it doesn't collide with the status topic.
+    //
+    // IMPORTANT: The ROS 2 Foxy vacuum plugin does NOT create a fixed joint!
+    // It only applies ~1N of attraction force toward the gripper link each tick.
+    // This means the domino mass must be < 0.1 kg for vacuum to hold against gravity.
+    // With mass=0.02 kg, weight=0.196N, the 1N force easily holds the piece.
     vacuum_gripper_client_ = this->create_client<std_srvs::srv::SetBool>(
         "/panda_hand/vacuum_switch");
+
+    // Link attacher plugin: creates/destroys a FIXED ODE JOINT in Gazebo.
+    // This is the standard "cheat" for Gazebo grasping — real robots use
+    // force feedback (like the Robot-Domino-Artist project's adaptive_stop).
+    link_attach_client_ = this->create_client<std_srvs::srv::SetBool>(
+        "/link_attacher/attach");
+    link_detach_client_ = this->create_client<std_srvs::srv::SetBool>(
+        "/link_attacher/detach");
 
     // GripperCommand action clients for individual finger control.
     // These bypass MoveIt and talk directly to the GripperActionControllers,
@@ -213,6 +226,17 @@ public:
           "Vacuum gripper service NOT available after 30 s — vacuum grasping unavailable.");
     }
 
+    // Wait for link attacher plugin services (Gazebo world plugin)
+    RCLCPP_INFO(this->get_logger(), "Waiting for link attacher services…");
+    bool attach_ok = link_attach_client_->wait_for_service(std::chrono::seconds(15));
+    bool detach_ok = link_detach_client_->wait_for_service(std::chrono::seconds(5));
+    RCLCPP_INFO(this->get_logger(), "Link attacher services: attach=%s, detach=%s",
+                attach_ok ? "OK" : "MISSING", detach_ok ? "OK" : "MISSING");
+    if (!attach_ok || !detach_ok) {
+      RCLCPP_WARN(this->get_logger(),
+          "Link attacher plugin not loaded! Fixed-joint grasping will NOT work.");
+    }
+
     // Wait for GripperCommand action servers (finger controllers)
     RCLCPP_INFO(this->get_logger(), "Waiting for gripper action servers…");
     bool left_ok = left_gripper_client_->wait_for_action_server(std::chrono::seconds(10));
@@ -231,6 +255,8 @@ private:
   using GripperAction = control_msgs::action::GripperCommand;
   rclcpp::Subscription<visualization_msgs::msg::MarkerArray>::SharedPtr detections_sub_;
   rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr vacuum_gripper_client_;
+  rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr link_attach_client_;
+  rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr link_detach_client_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr vacuum_status_sub_;
   rclcpp_action::Client<GripperAction>::SharedPtr left_gripper_client_;
   rclcpp_action::Client<GripperAction>::SharedPtr right_gripper_client_;
@@ -321,17 +347,25 @@ private:
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // execute_domino_play — simplified linear pick-and-place sequence:
+  // execute_domino_play — ULTRA-SIMPLE pick-and-place
   //
-  //   1. Hover above piece
-  //   2. Open fingers
-  //   3. Descend onto piece
-  //   4. Close fingers (grab)
-  //   5. Go directly to destination (above, then lower)
-  //   6. Open fingers (release)
-  //   7. Come back up (ready to search for next piece)
+  //   Modelled on the reference project (simple_pickplace.py) which uses
+  //   NO gripper at all — just Cartesian moves.  We add vacuum only.
   //
-  //   No intermediate poses.  Straight: source → destination → up.
+  //   FINGERS STAY FULLY OPEN for the entire mission.  They are NOT used
+  //   for gripping because any finger movement near the piece knocks it
+  //   off the vacuum.  The 1N vacuum force easily holds 0.02 kg.
+  //
+  //   Sequence:
+  //     1. Open fingers wide (once, before anything else)
+  //     2. Joint-space move above pick position
+  //     3. Cartesian straight-line descend to piece
+  //     4. Vacuum ON, wait for attachment
+  //     5. Cartesian straight-line lift
+  //     6. Joint-space move above place position
+  //     7. Cartesian straight-line descend to place
+  //     8. Vacuum OFF, wait for detachment
+  //     9. Cartesian lift, go home
   // ─────────────────────────────────────────────────────────────────────────
   void execute_domino_play(const DominoPiece &center, const DominoPiece &target)
   {
@@ -339,18 +373,10 @@ private:
       "MISSION START  center=(%.3f,%.3f)  target=(%.3f,%.3f) yaw=%.2f",
       center.x, center.y, target.x, target.y, target.yaw);
 
-    // ── Grasp yaw: fingers close ACROSS piece short axis (24 mm) ────────
-    //   panda_hand_joint rotates −π/4 from link8 around Z.
-    //   Finger prismatic axis = hand Y.  Hand Y in world = θ_link8 − π/4.
-    //   For hand Y ∥ short axis (target.yaw + π/2):
-    //     θ_link8 = target.yaw + π/2 + π/4 = target.yaw + 3π/4
-    //   Short axis chosen for simulation:
-    //     • 18 mm descent clearance per side (vs 6 mm on long axis)
-    //     • 24 mm across → stronger clamping than 48 mm
-    //     • Reference uses long axis with force feedback we don't have
+    // ── Grasp yaw ────────────────────────────────────────────────────────
     const double grasp_yaw = target.yaw + 3.0 * M_PI / 4.0;
 
-    // ── Compute destination pose ──────────────────────────────────────────
+    // ── Compute destination pose ─────────────────────────────────────────
     double drop_x = center.x + std::cos(center.match_angle) * DOMINO_LEN;
     double drop_y = center.y + std::sin(center.match_angle) * DOMINO_LEN;
     double delta_piece = (center.match_angle + M_PI) - target.match_angle;
@@ -363,12 +389,15 @@ private:
       target.x, target.y, drop_x, drop_y);
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 1 — HOVER above piece
+    //  STEP 1 — OPEN FINGERS wide and leave them open for the whole mission
     // ═══════════════════════════════════════════════════════════════════════
-    RCLCPP_INFO(this->get_logger(), "  STEP 1 — hovering above piece...");
-    move_group_->setMaxVelocityScalingFactor(0.3);
-    move_group_->setMaxAccelerationScalingFactor(0.3);
+    RCLCPP_INFO(this->get_logger(), "  STEP 1 — opening fingers wide...");
+    muovi_pinza("open");
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 2 — HOVER above piece (joint-space, like reference "ready")
+    // ═══════════════════════════════════════════════════════════════════════
+    RCLCPP_INFO(this->get_logger(), "  STEP 2 — hovering above piece...");
     bool hover_ok = false;
     const std::vector<double> yaw_tweaks = {0.0, 0.05, -0.05, 0.1, -0.1, M_PI};
     double pick_yaw = grasp_yaw;
@@ -379,28 +408,13 @@ private:
         break;
       }
     }
-    move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
-    move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
-
     if (!hover_ok) {
       RCLCPP_ERROR(this->get_logger(), "  Cannot reach above piece — aborting.");
       emergency_stop_and_recover();
       return;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 2 — OPEN fingers (ref: gripper_width(0.06, 0.05))
-    // ═══════════════════════════════════════════════════════════════════════
-    RCLCPP_INFO(this->get_logger(), "  STEP 2 — opening fingers...");
-    muovi_pinza("open");
-    rclcpp::sleep_for(std::chrono::seconds(2));  // ref: time.sleep(2)
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 2b — Remove table + domino from MoveIt collision scene
-    //   Reference: lower_until_force_limit() calls remove_table before descent.
-    //   This allows the arm to descend low enough for finger pads to fully
-    //   wrap the piece.  Table is re-added after gripping (STEP 4).
-    // ═══════════════════════════════════════════════════════════════════════
+    // Remove table + domino from MoveIt collision scene for descent
     std::string target_obj = find_closest_domino(target.x, target.y);
     {
       std::vector<std::string> remove_ids = {"work_table"};
@@ -410,26 +424,18 @@ private:
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 3 — DESCEND onto piece
-    //   Reference uses plan_pose_path (IK goal) for descent (MOVE 4),
-    //   with vel=0.1, acc=0.1.  Then retries up to 100 times.
-    //   We try IK with slow speed up to 5 times, then Cartesian fallback.
-    //   Table collision is already removed (STEP 2b).
+    //  STEP 3 — DESCEND onto piece (Cartesian straight line, slow)
     // ═══════════════════════════════════════════════════════════════════════
-    RCLCPP_INFO(this->get_logger(), "  STEP 3 — descending to z=%.4f (slow, IK first)...", z_presa_);
-    move_group_->setMaxVelocityScalingFactor(0.1);     // ref: 0.1 for descent
-    move_group_->setMaxAccelerationScalingFactor(0.1);  // ref: 0.1 for descent
+    RCLCPP_INFO(this->get_logger(), "  STEP 3 — Cartesian descend to z=%.4f...", z_presa_);
+    move_group_->setMaxVelocityScalingFactor(0.1);
+    move_group_->setMaxAccelerationScalingFactor(0.1);
 
-    bool descended = false;
-    for (int ik_try = 1; ik_try <= 5 && !descended; ++ik_try) {
-      RCLCPP_INFO(this->get_logger(), "    IK descent attempt %d/5...", ik_try);
-      descended = plan_and_execute(target.x, target.y, z_presa_, pick_yaw);
-    }
+    bool descended = cartesian_move(target.x, target.y, z_presa_, pick_yaw);
     if (!descended) {
-      RCLCPP_WARN(this->get_logger(), "    IK descent failed after 5 tries, trying Cartesian...");
-      descended = cartesian_descend(target.x, target.y, z_alta_, z_presa_, pick_yaw);
+      RCLCPP_WARN(this->get_logger(), "    Cartesian failed, trying IK...");
+      for (int t = 1; t <= 3 && !descended; ++t)
+        descended = plan_and_execute(target.x, target.y, z_presa_, pick_yaw);
     }
-
     move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
     move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
 
@@ -440,72 +446,61 @@ private:
       emergency_stop_and_recover();
       return;
     }
-    rclcpp::sleep_for(std::chrono::seconds(1));  // settle
+    rclcpp::sleep_for(std::chrono::seconds(1));  // let everything settle
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 4 — GRASP piece
-    //   Reference sequence (Robot-Domino-Artist):
-    //     1. Attach collision object (for MoveIt planning)
-    //     2. Close fingers (physical grip via GripperCommand with stall detection)
-    //     3. Vacuum ON (backup ODE fixed joint)
-    //   Fingers close FIRST so the piece is gripped by friction BEFORE
-    //   the vacuum fixed joint is created.  If we did vacuum first, the
-    //   leftfinger would drag the piece sideways when closing.
+    //  STEP 4 — GRASP: vacuum + fixed joint (Gazebo "cheat")
+    //
+    //   Real robots (like Robot-Domino-Artist) use force feedback on the
+    //   real Franka gripper.  In Gazebo we need two mechanisms:
+    //     1. Vacuum ON — applies ~1N attraction (helps but unreliable alone)
+    //     2. Link attacher — creates a fixed ODE joint (the real hold)
+    //
+    //   The fixed joint is the industry-standard Gazebo grasping approach.
     // ═══════════════════════════════════════════════════════════════════════
-    RCLCPP_INFO(this->get_logger(), "  STEP 4 — grasping piece...");
+    RCLCPP_INFO(this->get_logger(), "  STEP 4 — grasp (vacuum + fixed joint)...");
 
-    // 4a. Attach collision object for MoveIt planning (ref: attach BEFORE close)
+    // Attach collision object to hand for MoveIt planning
     if (!target_obj.empty()) {
       add_domino_as_attached(target_obj);
       attached_object_id_ = target_obj;
     }
 
-    // 4b. Close fingers via GripperCommand action (with stall detection)
-    //     Target: 0.005/finger (ref: domino_length_closing = 0.01 total).
-    //     The controller has stall_timeout=1.0s — it stops when fingers
-    //     contact the piece (stalls), just like the reference adaptive_stop.
-    //     max_effort=10N prevents pushing the piece away.
-    muovi_pinza("close");
-    rclcpp::sleep_for(std::chrono::seconds(2));  // ref: time.sleep(2) after close
-
-    // 4c. Vacuum ON for backup grip (ODE fixed joint)
-    RCLCPP_INFO(this->get_logger(), "  STEP 4c — vacuum ON (backup)...");
+    // 4a. Vacuum ON (provides some attraction force)
     call_vacuum_service(true);
-    rclcpp::sleep_for(std::chrono::milliseconds(500));
-    RCLCPP_INFO(this->get_logger(), "  Vacuum status: %s",
-                vacuum_attached_.load() ? "ATTACHED" : "not attached (finger grip only)");
+    rclcpp::sleep_for(std::chrono::seconds(1));
 
-    log_event("pick", true, "x=" + std::to_string(target.x));
+    // 4b. Create FIXED ODE JOINT — this is what actually holds the piece
+    call_link_attacher(true);
+    rclcpp::sleep_for(std::chrono::seconds(1));
+
+    bool vacuum_ok = vacuum_attached_.load();
+    RCLCPP_INFO(this->get_logger(), "  Vacuum: %s | Fixed joint: CREATED",
+                vacuum_ok ? "ATTACHED" : "not attached (joint holds anyway)");
+    log_event("pick", true, "fixed_joint+vac=" + std::string(vacuum_ok ? "yes" : "no"));
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 4b — LIFT 10 cm (Cartesian, no collision check)
-    //   CRITICAL: at z_presa, fingertips are only 1.75 mm above the table.
-    //   MoveIt collision padding (~10 mm) would consider this IN-COLLISION
-    //   with the table, causing OMPL to fail on the transit plan.
-    //   Reference also lifts 15 cm (MOVEMENT 8) before transit.
-    //   We lift BEFORE re-adding the table to avoid the collision issue.
+    //  STEP 5 — LIFT straight up (Cartesian, slow)
     // ═══════════════════════════════════════════════════════════════════════
-    RCLCPP_INFO(this->get_logger(), "  STEP 4b — Cartesian lift 10 cm...");
-    double lift_z = z_presa_ + 0.10;
-    if (!cartesian_move(target.x, target.y, lift_z, pick_yaw)) {
+    RCLCPP_INFO(this->get_logger(), "  STEP 5 — Cartesian lift...");
+    move_group_->setMaxVelocityScalingFactor(0.1);
+    move_group_->setMaxAccelerationScalingFactor(0.1);
+    if (!cartesian_move(target.x, target.y, z_alta_, pick_yaw)) {
       RCLCPP_WARN(this->get_logger(), "    Cartesian lift failed, trying IK...");
-      plan_and_execute(target.x, target.y, lift_z, pick_yaw);
+      plan_and_execute(target.x, target.y, z_alta_, pick_yaw);
     }
-    // Check vacuum status after lift
-    RCLCPP_INFO(this->get_logger(), "  Vacuum status after lift: %s",
-                vacuum_attached_.load() ? "ATTACHED" : "finger grip only");
+    move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
+    move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
 
-    // NOW re-add table collision — arm is 10 cm higher, well clear of padding
+    RCLCPP_INFO(this->get_logger(), "  Vacuum after lift: %s",
+                vacuum_attached_.load() ? "ATTACHED ✓" : "DETACHED ✗");
+
     add_table_collision();
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 5 — MOVE to destination (above drop, then lower)
-    //   Reference: MOVE 8 (lift) → MOVE 9 (go home) → MOVE 10 (above goal)
+    //  STEP 6 — TRANSIT above destination (joint-space)
     // ═══════════════════════════════════════════════════════════════════════
-    RCLCPP_INFO(this->get_logger(), "  STEP 5a — transit above destination...");
-    move_group_->setMaxVelocityScalingFactor(0.3);
-    move_group_->setMaxAccelerationScalingFactor(0.3);
-
+    RCLCPP_INFO(this->get_logger(), "  STEP 6 — transit above destination...");
     bool transit_ok = false;
     const std::vector<double> drop_yaw_offsets = {0.0, 0.1, -0.1, 0.2, -0.2, 0.3, -0.3};
     for (double dyo : drop_yaw_offsets) {
@@ -515,35 +510,30 @@ private:
         break;
       }
     }
-    move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
-    move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
-
     if (!transit_ok) {
       RCLCPP_ERROR(this->get_logger(), "  Cannot reach above destination — aborting.");
       emergency_stop_and_recover();
       return;
     }
 
-    // Remove table collision before lowering (same as pick descent)
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STEP 7 — DESCEND to place (Cartesian, slow)
+    // ═══════════════════════════════════════════════════════════════════════
     remove_table_collision();
 
-    // Lower to placement height — slow, IK first (like reference), Cartesian fallback
-    RCLCPP_INFO(this->get_logger(), "  STEP 5b — lowering to place (slow, IK first)...");
-    move_group_->setMaxVelocityScalingFactor(0.1);     // ref: 0.1 for descent
+    RCLCPP_INFO(this->get_logger(), "  STEP 7 — Cartesian descend to place...");
+    move_group_->setMaxVelocityScalingFactor(0.1);
     move_group_->setMaxAccelerationScalingFactor(0.1);
 
-    bool lowered = false;
-    for (int ik_try = 1; ik_try <= 5 && !lowered; ++ik_try) {
-      RCLCPP_INFO(this->get_logger(), "    IK lower attempt %d/5...", ik_try);
-      lowered = plan_and_execute(drop_x, drop_y, z_presa_, drop_yaw);
-    }
+    bool lowered = cartesian_move(drop_x, drop_y, z_presa_, drop_yaw);
     if (!lowered) {
-      RCLCPP_WARN(this->get_logger(), "    IK lower failed, trying Cartesian...");
-      lowered = cartesian_descend(drop_x, drop_y, z_alta_, z_presa_, drop_yaw);
+      RCLCPP_WARN(this->get_logger(), "    Cartesian lower failed, trying IK...");
+      for (int t = 1; t <= 3 && !lowered; ++t)
+        lowered = plan_and_execute(drop_x, drop_y, z_presa_, drop_yaw);
     }
-
     move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
     move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
+
     if (!lowered) {
       RCLCPP_ERROR(this->get_logger(), "  Cannot lower to place — aborting.");
       add_table_collision();
@@ -552,35 +542,26 @@ private:
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 6 — OPEN fingers (release piece)
-    //   Reference: detach, open gripper, sleep(2)
+    //  STEP 8 — RELEASE piece (vacuum OFF)
     // ═══════════════════════════════════════════════════════════════════════
-    RCLCPP_INFO(this->get_logger(), "  STEP 6 — releasing piece...");
+    RCLCPP_INFO(this->get_logger(), "  STEP 8 — release piece (detach joint + vacuum OFF)...");
+    call_link_attacher(false);   // destroy fixed joint FIRST
+    rclcpp::sleep_for(std::chrono::milliseconds(500));
     if (!attached_object_id_.empty()) {
       try { move_group_->detachObject(attached_object_id_); attached_object_id_ = ""; }
       catch (...) {}
     }
-    muovi_pinza("open");
-    rclcpp::sleep_for(std::chrono::seconds(2));
+    call_vacuum_service(false);
+    rclcpp::sleep_for(std::chrono::seconds(2));  // let piece settle on table
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 7 — COME BACK UP (ready to search for next piece)
-    //   Cartesian lift BEFORE re-adding table (same collision padding issue
-    //   as STEP 4b — fingertips only 1.75 mm above table at z_presa).
+    //  STEP 9 — LIFT and go home
     // ═══════════════════════════════════════════════════════════════════════
-    RCLCPP_INFO(this->get_logger(), "  STEP 7 — lifting from place position...");
-    double place_lift_z = z_presa_ + 0.10;
-    if (!cartesian_move(drop_x, drop_y, place_lift_z, drop_yaw)) {
-      plan_and_execute(drop_x, drop_y, place_lift_z, drop_yaw);
-    }
-
-    // NOW re-add table collision — arm is clear
-    add_table_collision();
-
-    RCLCPP_INFO(this->get_logger(), "  STEP 7b — returning to home...");
+    RCLCPP_INFO(this->get_logger(), "  STEP 9 — lifting and going home...");
     if (!cartesian_move(drop_x, drop_y, z_alta_, drop_yaw)) {
       plan_and_execute(drop_x, drop_y, z_alta_, drop_yaw);
     }
+    add_table_collision();
     go_to_home();
 
     RCLCPP_INFO(this->get_logger(), "MISSION COMPLETE – domino placed.");
@@ -609,7 +590,7 @@ private:
     waypoints.push_back(make_pose(x, y, z_end,   yaw));  // end   = grasp
 
     moveit_msgs::msg::RobotTrajectory trajectory;
-    double fraction = move_group_->computeCartesianPath(waypoints, 0.005, 0.0, trajectory, false);
+    double fraction = move_group_->computeCartesianPath(waypoints, 0.01, 0.0, trajectory, false);
     RCLCPP_INFO(this->get_logger(),
       "Cartesian descend fraction: %.2f  (%.3f → %.3f)", fraction, z_start, z_end);
 
@@ -814,9 +795,10 @@ private:
 
     std::vector<geometry_msgs::msg::Pose> waypoints = {make_pose(x, y, z, yaw)};
     moveit_msgs::msg::RobotTrajectory trajectory;
-    // Use smaller max_step (0.005 vs 0.01) for smoother Cartesian interpolation
-    // matching the reference implementation's approach
-    double fraction = move_group_->computeCartesianPath(waypoints, 0.005, 0.0, trajectory, false);
+    // Use 0.01 m step (10mm) for smooth Cartesian interpolation.
+    // Fewer waypoints = smoother velocity profile = less chance of
+    // jerky motion dislodging the piece from the vacuum grip.
+    double fraction = move_group_->computeCartesianPath(waypoints, 0.01, 0.0, trajectory, false);
     RCLCPP_INFO(this->get_logger(), "Cartesian path fraction: %.2f (goal: %.1f, %.1f, %.1f)",
                 fraction, x, y, z);
 
@@ -889,44 +871,17 @@ private:
 
   void muovi_pinza(const std::string &command)
   {
-    bool is_close = (command == "close");
-    RCLCPP_INFO(this->get_logger(), "GRIPPER: %s  (simulate=%s)",
-                command.c_str(), simulate_gripper_ ? "true" : "false");
+    RCLCPP_INFO(this->get_logger(), "GRIPPER: %s", command.c_str());
 
-    // ── Grasp strategy (matching reference Robot-Domino-Artist) ──────────
-    //   CLOSE: fingers close FIRST (physical grip), then vacuum ON for backup.
-    //   OPEN:  vacuum OFF, then fingers open.
-    //
-    //   Uses MoveIt panda_gripper group so both joints move in a SINGLE
-    //   synchronised trajectory.  Separate GripperCommand action clients
-    //   caused asymmetric timing (one finger arrived before the other),
-    //   tipping the piece sideways.
-
-    if (is_close) {
-      // ── CLOSE: both fingers simultaneously via MoveIt hand_group ───
-      //   Piece short axis = DOMINO_WID (24 mm).  Fingers close across it.
-      //   Contact when gap = DOMINO_WID → q_contact = DOMINO_WID/2 = 0.012.
-      //
-      //   We command q = DOMINO_WID/2 − 0.002 = 0.010/finger (20 mm gap).
-      //   This is only 2 mm past contact per side — gentle clamping.
-      const double close_pos = DOMINO_WID / 2.0 - 0.002;  // 0.010/finger
-      RCLCPP_INFO(this->get_logger(),
-          "GRIPPER: closing to %.4f/finger (%.1fmm gap, piece=%.0fmm)...",
-          close_pos, close_pos * 2000.0, DOMINO_WID * 1000.0);
-      move_fingers_to(close_pos);
-      rclcpp::sleep_for(std::chrono::seconds(2));
-      RCLCPP_INFO(this->get_logger(), "GRIPPER: fingers closed.");
-    } else {
-      // ── OPEN: vacuum OFF first, then open fingers ──────────────────
-      RCLCPP_INFO(this->get_logger(), "GRIPPER: vacuum OFF, opening fingers...");
-      call_vacuum_service(false);
-      rclcpp::sleep_for(std::chrono::milliseconds(500));
-
+    if (command == "open") {
+      // Open fingers wide — 0.04 = max joint limit
+      RCLCPP_INFO(this->get_logger(), "GRIPPER: opening fingers wide...");
       move_fingers_to(0.035);
       rclcpp::sleep_for(std::chrono::seconds(1));
-      rclcpp::sleep_for(std::chrono::seconds(2));
       RCLCPP_INFO(this->get_logger(), "GRIPPER: fingers open.");
     }
+    // "close" is intentionally a no-op.
+    // We rely ONLY on vacuum for gripping — fingers stay open.
   }
 
   // ── Helper: send GripperCommand to one finger controller ────────────────
@@ -998,6 +953,42 @@ private:
     return false;
   }
 
+  // ── Helper: attach/detach domino via the link_attacher Gazebo plugin ────
+  bool call_link_attacher(bool attach)
+  {
+    auto &client = attach ? link_attach_client_ : link_detach_client_;
+    const char *label = attach ? "ATTACH" : "DETACH";
+
+    if (!client->service_is_ready()) {
+      RCLCPP_WARN(this->get_logger(),
+          "Link attacher %s service not ready, waiting 5 s...", label);
+      if (!client->wait_for_service(std::chrono::seconds(5))) {
+        RCLCPP_ERROR(this->get_logger(),
+            "Link attacher %s service still not available!", label);
+        return false;
+      }
+    }
+
+    auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+    request->data = true;  // always true — the service itself decides attach vs detach
+
+    auto future = client->async_send_request(request);
+    auto status = future.wait_for(std::chrono::seconds(10));
+    if (status == std::future_status::ready) {
+      auto response = future.get();
+      RCLCPP_INFO(this->get_logger(),
+          "LINK %s → success=%s, msg='%s'",
+          label,
+          response->success ? "true" : "false",
+          response->message.c_str());
+      return response->success;
+    }
+
+    RCLCPP_ERROR(this->get_logger(),
+        "Link attacher %s service call timed out (10 s)!", label);
+    return false;
+  }
+
   void go_to_home()
   {
     const std::vector<double> home = {0, -0.785, 0, -2.356, 0, 1.571, 0.785};
@@ -1039,6 +1030,8 @@ private:
   {
     RCLCPP_ERROR(this->get_logger(), "EMERGENCY STOP – recovering.");
     try { move_group_->stop(); } catch (...) {}
+    call_link_attacher(false);   // release fixed joint if any
+    call_vacuum_service(false);  // vacuum OFF
     muovi_pinza("open");
     if (!attached_object_id_.empty()) {
       try {

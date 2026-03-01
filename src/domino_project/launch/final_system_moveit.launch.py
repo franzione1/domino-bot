@@ -1,7 +1,7 @@
 import os
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import get_package_share_directory, get_package_prefix
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, TimerAction
+from launch.actions import IncludeLaunchDescription, TimerAction, SetEnvironmentVariable
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 import xacro
@@ -110,7 +110,18 @@ def generate_launch_description():
     camera_sdf = os.path.join(my_pkg, 'models', 'camera_sensor', 'model.sdf')
 
     # --- 3. NODI ---
-    panda_world = os.path.join(panda_pkg, 'worlds', 'panda.world')
+    # Use our custom world file that includes the LinkAttacherPlugin
+    # (creates fixed ODE joints for grasping — the standard Gazebo simulation "cheat")
+    panda_world = os.path.join(my_pkg, 'worlds', 'panda_domino.world')
+
+    # Ensure Gazebo can find our link_attacher_plugin.so
+    my_prefix = get_package_prefix('domino_project')
+    plugin_path = os.path.join(my_prefix, 'lib')
+    existing = os.environ.get('GAZEBO_PLUGIN_PATH', '')
+    full_plugin_path = plugin_path + (':' + existing if existing else '')
+    set_gazebo_plugin_path = SetEnvironmentVariable(
+        name='GAZEBO_PLUGIN_PATH', value=full_plugin_path)
+
     gazebo_launch_pkg = get_package_share_directory('gazebo_ros')
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([os.path.join(gazebo_launch_pkg, 'launch'), '/gazebo.launch.py']),
@@ -294,6 +305,7 @@ def generate_launch_description():
     panda_handright_controller = Node(package="controller_manager", executable="spawner.py", arguments=["panda_handright_controller"])
 
     return LaunchDescription([
+        set_gazebo_plugin_path,
         gazebo,
         TimerAction(period=1.0, actions=[static_tf, robot_state_publisher, spawn_robot]),
         TimerAction(period=8.0, actions=[spawn_table]),

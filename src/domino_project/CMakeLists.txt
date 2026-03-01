@@ -21,6 +21,19 @@ find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(rclcpp_action REQUIRED)
+find_package(gazebo_dev REQUIRED)
+find_package(gazebo_ros REQUIRED)
+
+# --- GAZEBO LINK ATTACHER PLUGIN ---
+# Creates a fixed ODE joint between gripper and domino (the standard
+# Gazebo "cheat" for grasping simulation — real robots use force feedback)
+add_library(link_attacher_plugin SHARED plugins/link_attacher_plugin.cpp)
+ament_target_dependencies(link_attacher_plugin
+  gazebo_dev
+  gazebo_ros
+  rclcpp
+  std_srvs
+)
 
 # --- NODO C++ ---
 # Usiamo il percorso dove hai attualmente il file
@@ -42,6 +55,11 @@ ament_target_dependencies(robot_mover_cpp
 install(TARGETS
   robot_mover_cpp
   DESTINATION lib/${PROJECT_NAME}
+)
+
+install(TARGETS
+  link_attacher_plugin
+  DESTINATION lib
 )
 # --------------------------------------
 
