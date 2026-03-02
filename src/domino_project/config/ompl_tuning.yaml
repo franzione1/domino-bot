@@ -1,0 +1,11 @@
+move_group:
+  planning_time: 10.0
+  planner_configs:
+    RRTConnect:
+      type: geometric::RRTConnect
+      range: 0.5
+    RRTstar:
+      type: geometric::RRTstar
+  default_planner_config: RRTConnect
+  use_approximate_connectivity: false
+  goal_bias: 0.05

@@ -1,0 +1,29 @@
+Visualization Manager:
+  Class: "org.ros2.rviz2.VisualizationManager"
+  Name: "Visualization Manager"
+  Global Options:
+    Fixed Frame: world
+  Displays:
+    - Name: RobotModel
+      Class: rviz_default_plugins/RobotModel
+      Enabled: true
+      Robot Description: robot_description
+    - Name: TF
+      Class: rviz_default_plugins/TF
+      Enabled: true
+    - Name: Planning Scene
+      Class: moveit_ros_visualization/PlanningScene
+      Enabled: true
+      Scene Topic: /monitored_planning_scene
+    - Name: MotionPlanning
+      Class: moveit_ros_visualization/MoveItMotionPlanningDisplay
+      Enabled: true
+      Planning Scene Topic: /monitored_planning_scene
+    - Name: Domino Detections
+      Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Topic: /domino_detections
+    - Name: Interactive Markers
+      Class: rviz_default_plugins/InteractiveMarkers
+      Enabled: true
+      Topic: /interactive_markers

@@ -1,37 +1,47 @@
 <?xml version="1.0" ?>
 <sdf version="1.7">
   <model name="domino_green_blue">
-    <static>false</static> <link name="link">
-      
+    <static>false</static>
+    <link name="link">
+      <!-- Dimensions: 0.048 x 0.024 x 0.020 m (height sized for finger grasping) -->
       <inertial>
-        <mass>0.1</mass> <inertia>
-          <ixx>0.0000416</ixx>
-          <ixy>0</ixy>
-          <ixz>0</ixz>
-          <iyy>0.0001041</iyy>
-          <iyz>0</iyz>
-          <izz>0.0001041</izz>
+        <mass>0.02</mass>
+        <inertia>
+          <ixx>1.627e-6</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>4.507e-6</iyy><iyz>0</iyz>
+          <izz>4.800e-6</izz>
         </inertia>
       </inertial>
-
       <collision name="collision">
+        <max_contacts>20</max_contacts>
         <geometry>
           <box>
-            <size>0.1 0.05 0.02</size> </box>
+            <size>0.048 0.024 0.020</size>
+          </box>
         </geometry>
         <surface>
           <friction>
             <ode>
-              <mu>1.0</mu> <mu2>1.0</mu2>
+              <mu>100.0</mu>
+              <mu2>100.0</mu2>
             </ode>
           </friction>
+          <contact>
+            <ode>
+              <kp>100000000.0</kp>
+              <kd>1000.0</kd>
+              <min_depth>0.001</min_depth>
+              <max_vel>0.0</max_vel>
+            </ode>
+          </contact>
         </surface>
       </collision>
-
       <visual name="visual_left">
-        <pose>-0.025 0 0 0 0 0</pose> <geometry>
+        <pose>-0.012 0 0 0 0 0</pose>
+        <geometry>
           <box>
-            <size>0.05 0.05 0.02</size> </box>
+            <size>0.024 0.024 0.020</size>
+          </box>
         </geometry>
         <material>
           <script>
@@ -40,11 +50,11 @@
           </script>
         </material>
       </visual>
-
       <visual name="visual_right">
-        <pose>0.025 0 0 0 0 0</pose> <geometry>
+        <pose>0.012 0 0 0 0 0</pose>
+        <geometry>
           <box>
-            <size>0.05 0.05 0.02</size>
+            <size>0.024 0.024 0.020</size>
           </box>
         </geometry>
         <material>
@@ -54,7 +64,6 @@
           </script>
         </material>
       </visual>
-
     </link>
   </model>
 </sdf>

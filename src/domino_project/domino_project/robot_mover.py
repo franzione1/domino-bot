@@ -1,140 +1,163 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from geometry_msgs.msg import Point
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from control_msgs.action import GripperCommand
+from geometry_msgs.msg import Point 
 import math
 import time
 import threading
+from std_msgs.msg import Bool
 
 class RobotMover(Node):
     def __init__(self):
         super().__init__('robot_mover')
         
-        # --- PARAMETRI DI CALIBRAZIONE ---
-        self.MOLTIPLICATORE_X = 1.0  
-        self.MOLTIPLICATORE_Y = -1.0 
-        self.OFFSET_X = 0.00  
-        self.OFFSET_Y = 0.00  
+        self.arm_publisher = self.create_publisher(JointTrajectory, '/panda_arm_controller/joint_trajectory', 10)
+        self.gripper_client = ActionClient(self, GripperCommand, '/panda_hand_controller/gripper_cmd')
         
-        # --- ALTEZZE GEOMETRICHE ---
-        self.ALTEZZA_BASE = 1.305      
-        self.Z_TASELLO = 1.32          
-        self.LUNGHEZZA_MANO = 0.22 
+        self.vision_subscription = self.create_subscription(Point, '/domino_position', self.vision_callback, 10)
         
-        # Altezze target del POLSO (Wrist)
-        self.Z_POLSO_VOLO = (self.Z_TASELLO + self.LUNGHEZZA_MANO) + 0.25 
-        self.Z_POLSO_PRESA = (self.Z_TASELLO + self.LUNGHEZZA_MANO) + 0.11
+        self.joint_names = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7']
         
-        self.TEMPO_PAUSA_DEBUG = 3.0 
+        # NUOVO PUBLISHER PER IL TRUCCO
+        self.vacuum_pub = self.create_publisher(Bool, '/panda_hand/grasping', 10)
+
+        # --- TUNING ---
+        self.HOME_POS = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+        
+        self.OFFSET_LATERALE_BRACCIO = 0.02 
+        self.OFFSET_J7_POLSO = 0.735
+        self.OFFSET_DISTANZA_REACH = 0.0
+        self.TARGET_WORLD_ANGLE = 1.57
         
         self.L1 = 0.316
         self.L2 = 0.384
-        self.HOME_POS = [0.0, -0.78, 0.0, -2.35, 0.0, 1.57, 0.78]
+        self.OFFSET_SPALLA = 0.33
+        self.LUNGHEZZA_MANO = 0.22 
+        self.Z_SICUREZZA = 0.233
+        self.Z_ALTA = 0.35        
         
-        self.last_target_x = 0.0
-        self.last_target_y = 0.0
+        self.CENTER_X = 0.50
+        self.CENTER_Y = 0.00
+        
+        # Mappa per decodificare il colore
+        self.COLOR_MAP = {1.0: "ROSSO", 2.0: "VERDE", 3.0: "BLU"}
+        
+        self.is_busy = False 
+        self.muovi_braccio(self.HOME_POS, durata=5.0)
+        self.get_logger().info('ROBOT PRONTO. Attendo target e colore...')
 
-        self.subscription = self.create_subscription(Point, '/domino_position', self.listener_callback, 10)
-        self.arm_publisher = self.create_publisher(JointTrajectory, '/panda_arm_controller/joint_trajectory', 10)
-        self.gripper_client = ActionClient(self, GripperCommand, '/panda_hand_controller/gripper_cmd')
+    def vision_callback(self, msg):
+        if self.is_busy: return 
+        if msg.x == 0.0 and msg.y == 0.0: return
+        if math.sqrt(msg.x**2 + msg.y**2) > 0.85: return 
+
+        self.is_busy = True
+        # Passiamo anche msg.z (codice colore) al thread
+        threading.Thread(target=self.esegui_missione, args=(msg.x, msg.y, msg.z)).start()
+
+    def esegui_missione(self, target_x, target_y, color_code):
+        # Decodifica Colore
+        nome_colore = self.COLOR_MAP.get(float(color_code), "SCONOSCIUTO")
+
+        # 1. Calcoli Angolari
+        distanza_totale = math.sqrt(target_x**2 + target_y**2)
+        theta_base_atan = math.atan2(target_y, target_x)
+        
+        try:
+            delta_correction = math.asin(self.OFFSET_LATERALE_BRACCIO / distanza_totale)
+        except ValueError:
+            delta_correction = 0.0 
             
-        self.joint_names = ['panda_joint1', 'panda_joint2', 'panda_joint3', 'panda_joint4', 'panda_joint5', 'panda_joint6', 'panda_joint7']
-        
-        self.target_locked = True 
-        self.timer_init = self.create_timer(1.0, self.mossa_di_risveglio)
-        self.get_logger().info('Robot Mover: In attesa di avvio...')
+        theta1_scelto = theta_base_atan - delta_correction
+        theta7_scelto = (self.TARGET_WORLD_ANGLE - theta1_scelto) + self.OFFSET_J7_POLSO
 
-    def mossa_di_risveglio(self):
-        self.get_logger().info('>>> RESET HOME <<<')
-        self.muovi_braccio(self.HOME_POS, durata=4.0)
-        self.muovi_pinza(0.04) 
-        self.timer_init.cancel()
-        threading.Timer(5.0, self.sblocca_target).start()
+        # --- FUNZIONE LOG PERSISTENTE ---
+        def log_status(fase):
+            print("\n" + "="*40)
+            print(f"  MISSIONE ATTIVA: {nome_colore}")   # <--- QUI MOSTRA IL COLORE
+            print("="*40)
+            print(f"  Target X : {target_x:.3f}")
+            print(f"  Target Y : {target_y:.3f}")
+            print("-" * 40)
+            print(f"  ANGOLO Base (Calc) : {math.degrees(theta_base_atan):.2f}°")
+            print(f"  CORREZIONE Offset  : {math.degrees(-delta_correction):.2f}°")
+            print(f"  -> ANGOLO SCELTO   : {math.degrees(theta1_scelto):.2f}°")
+            print("-" * 40)
+            print(f"  STATUS: {fase}")
+            print("="*40 + "\n")
 
-    def sblocca_target(self):
-        self.target_locked = False
-        self.get_logger().info('>>> SISTEMA PRONTO <<<')
-
-    def listener_callback(self, msg):
-        if self.target_locked: return
+        # --- ESECUZIONE ---
+        log_status("INIZIO - Calcolo Completato")
         
-        distanza = math.sqrt((msg.x - self.last_target_x)**2 + (msg.y - self.last_target_y)**2)
-        if distanza < 0.05: return
-
-        self.target_locked = True
-        self.last_target_x = msg.x
-        self.last_target_y = msg.y
-        
-        self.get_logger().info(f'TARGET ACQUISITO: X={msg.x:.3f} Y={msg.y:.3f}')
-        mission = threading.Thread(target=self.esegui_presa_diretta, args=(msg.x, msg.y))
-        mission.start()
-
-    def pausa_debug(self):
-        self.get_logger().warn(f'[DEBUG] Pausa {self.TEMPO_PAUSA_DEBUG}s...')
-        time.sleep(self.TEMPO_PAUSA_DEBUG)
-
-    def esegui_presa_diretta(self, raw_x, raw_y):
-        tx = (raw_x * self.MOLTIPLICATORE_X) + self.OFFSET_X
-        ty = (raw_y * self.MOLTIPLICATORE_Y) + self.OFFSET_Y
-        drop_x = 0.5 * self.MOLTIPLICATORE_X
-        drop_y = 0.0 
-        
-        # 1. VOLO
-        self.get_logger().info(f'--> 1. VOLO (Z_Polso={self.Z_POLSO_VOLO:.2f})')
-        q_approccio = self.calcola_ik_stable(tx, ty, self.Z_POLSO_VOLO)
-        if q_approccio: 
-            self.muovi_braccio(q_approccio, 4.0)
-            time.sleep(4.5)
-            self.pausa_debug() 
-        
-        # 2. APERTURA
-        self.get_logger().info('--> 2. APERTURA')
-        self.muovi_pinza(0.04) 
-        time.sleep(0.5)
-        
-        # 3. DISCESA
-        self.get_logger().info(f'--> 3. DISCESA (Z_Polso={self.Z_POLSO_PRESA:.2f})')
-        q_giu = self.calcola_ik_stable(tx, ty, self.Z_POLSO_PRESA)
-        if q_giu: 
-            self.muovi_braccio(q_giu, 3.0) 
-            time.sleep(3.5)
-            self.pausa_debug() # ORA LA MANO DOVREBBE ESSERE DRITTA!
-        
-        # 4. PRESA
-        self.get_logger().info('--> 4. CHIUSURA')
-        self.muovi_pinza(0.0) 
-        time.sleep(1.0) 
-        self.pausa_debug() 
-        
-        # 5. RISALITA
-        self.get_logger().info('--> 5. RISALITA')
-        if q_approccio: self.muovi_braccio(q_approccio, 2.0)
-        time.sleep(2.5)
-        
-        # 6. DEPOSITO
-        self.get_logger().info(f'--> 6. DEPOSITO')
-        q_drop = self.calcola_ik_stable(drop_x, drop_y, self.Z_POLSO_VOLO)
-        if q_drop:
-            q_drop[6] += 1.57 # Ruota polso
-            self.muovi_braccio(q_drop, 4.0)
-        time.sleep(4.5)
-        self.pausa_debug() 
-        
-        self.muovi_pinza(0.04) 
-        time.sleep(1.0)
-        
-        self.get_logger().info('--> 7. HOME')
-        self.muovi_braccio(self.HOME_POS, 4.0)
+        self.muovi_cinematica(target_x, target_y, self.Z_ALTA, theta1_scelto, theta7_scelto)
+        log_status("Approccio Alto")
         time.sleep(4.0)
         
-        self.target_locked = False
-        self.get_logger().info('Missione completata.')
+        self.muovi_pinza(0.04, attiva_magnete=False) # Apertura pinza
+        time.sleep(1.0)
+        self.muovi_cinematica(target_x, target_y, self.Z_SICUREZZA, theta1_scelto, theta7_scelto)
+        log_status("Discesa sul pezzo")
+        time.sleep(5.0)
+        
+        self.muovi_pinza(0.027, attiva_magnete=True) # Chiusura pinza
+        time.sleep(1.5)
+        log_status("PRESA EFFETTUATA")
+
+        self.muovi_cinematica(target_x, target_y, self.Z_ALTA, theta1_scelto, theta7_scelto)
+        log_status("Sollevamento")
+        time.sleep(3.0)
+        
+        # Piazzamento
+        dest_x = self.CENTER_X
+        dest_y = self.CENTER_Y + 0.06
+        theta1_dest = math.atan2(dest_y, dest_x)
+        theta7_dest = (self.TARGET_WORLD_ANGLE - theta1_dest)
+        
+        self.muovi_cinematica(dest_x, dest_y, self.Z_ALTA, theta1_dest, theta7_dest)
+        log_status("Spostamento verso Centro")
+        time.sleep(4.0)
+        
+        self.muovi_cinematica(dest_x, dest_y, 0.25, theta1_dest, theta7_dest)
+        time.sleep(3.0)
+        
+        self.muovi_pinza(0.04, attiva_magnete=False) # Apertura pinza
+        time.sleep(1.5)
+        
+        self.muovi_braccio(self.HOME_POS, durata=4.0)
+        log_status("Ritorno in Home")
+        time.sleep(4.0)
+        
+        self.is_busy = False 
+        print(f"\n[FINE MISSIONE {nome_colore}] Torno in attesa.\n")
+
+    def muovi_cinematica(self, x, y, z, theta1_cmd, theta7_cmd):
+        if z < self.Z_SICUREZZA: z = self.Z_SICUREZZA
+        z_rel = z - self.OFFSET_SPALLA
+        r_totale = math.sqrt(x**2 + y**2) + self.OFFSET_DISTANZA_REACH
+        r_polso = r_totale - self.LUNGHEZZA_MANO
+        d = math.sqrt(r_polso**2 + z_rel**2)
+        
+        if d > (self.L1 + self.L2): d = self.L1 + self.L2 - 0.001
+            
+        cos_t4 = (self.L1**2 + self.L2**2 - d**2) / (2 * self.L1 * self.L2)
+        theta4 = -1.0 * (math.pi - math.acos(max(-1.0, min(1.0, cos_t4))))
+
+        val_acos = (self.L1**2 + d**2 - self.L2**2) / (2 * self.L1 * d)
+        theta2_geom = math.atan2(z_rel, r_polso) + math.acos(max(-1.0, min(1.0, val_acos)))
+        theta2_robot = (math.pi / 2) - theta2_geom
+
+        theta6 = -1.0 * (theta2_geom + theta4)
+        while theta7_cmd > 3.14: theta7_cmd -= 6.28
+        while theta7_cmd < -3.14: theta7_cmd += 6.28
+
+        target_pos = [theta1_cmd, theta2_robot, 0.0, theta4, 0.0, theta6, theta7_cmd] 
+        self.muovi_braccio(target_pos, durata=3.0)
 
     def muovi_braccio(self, posizioni, durata):
         msg = JointTrajectory()
-        msg.joint_names = self.joint_names
+        msg.joint_names = self.joint_names 
         point = JointTrajectoryPoint()
         point.positions = posizioni
         point.time_from_start.sec = int(durata)
@@ -142,45 +165,32 @@ class RobotMover(Node):
         msg.points.append(point)
         self.arm_publisher.publish(msg)
 
-    def muovi_pinza(self, apertura):
+    def muovi_pinza(self, apertura, attiva_magnete=False):
+        # 1. GESTIONE MAGNETE
+        # Pubblichiamo subito lo stato del magnete (True = Presa Incollata, False = Rilascio)
+        msg_vac = Bool()
+        msg_vac.data = attiva_magnete
+        self.vacuum_pub.publish(msg_vac)
+
+        # 2. MOVIMENTO FISICO DITA (Scenografia)
+        # Usiamo l'Action Client come hai configurato nel tuo __init__
         goal = GripperCommand.Goal()
         goal.command.position = apertura
-        goal.command.max_effort = 200.0 
-        if self.gripper_client.wait_for_server(timeout_sec=0.5):
+        goal.command.max_effort = 1000.0  # Forza alta per assicurarsi che si muova
+        
+        # Inviamo il comando alle dita
+        if self.gripper_client.wait_for_server(timeout_sec=1.0):
             self.gripper_client.send_goal_async(goal)
-
-    def calcola_ik_stable(self, x, y, z_wrist_abs):
-        z_rel = z_wrist_abs - (self.ALTEZZA_BASE + 0.33)
-        theta1 = math.atan2(y, x)
-        r = math.sqrt(x**2 + y**2) 
-        d = math.sqrt(r**2 + z_rel**2)
-        
-        if d > (self.L1 + self.L2): d = self.L1 + self.L2 - 0.001
-        
-        cos_theta4 = (self.L1**2 + self.L2**2 - d**2) / (2 * self.L1 * self.L2)
-        cos_theta4 = max(-1.0, min(1.0, cos_theta4))
-        theta4 = -1.0 * (math.pi - math.acos(cos_theta4))
-        
-        val_acos = (self.L1**2 + d**2 - self.L2**2) / (2 * self.L1 * d)
-        val_acos = max(-1.0, min(1.0, val_acos))
-        theta2 = math.atan2(z_rel, r) + math.acos(val_acos)
-        
-        # --- FIX DEFINITIVO MANO ---
-        # Formula geometrica: per puntare in basso (-90 gradi),
-        # il polso (J6) deve compensare l'inclinazione di spalla e gomito.
-        # J6 = (theta2 + theta4) + 90 gradi
-        theta6 = (theta2 + theta4) + 1.57
-        
-        # Controllo di sicurezza per il giunto Panda (Range -0.01 a 3.75)
-        if theta6 < 0.0: theta6 = 0.0
-        if theta6 > 3.75: theta6 = 3.75
-            
-        return [theta1, theta2, 0.0, theta4, 0.0, theta6, 0.79]
+        else:
+            self.get_logger().warn("Gripper Action Server non disponibile!")
 
 def main(args=None):
     rclpy.init(args=args)
     node = RobotMover()
-    rclpy.spin(node)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     node.destroy_node()
     rclpy.shutdown()
 

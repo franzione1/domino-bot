@@ -1,0 +1,72 @@
+<?xml version="1.0" ?>
+<!--
+  panda_domino.world — Panda robot world with link-attacher plugin for grasping.
+  Based on the IFRA Cranfield panda.world, with our LinkAttacherPlugin added.
+  
+  The LinkAttacherPlugin creates/destroys fixed ODE joints between the
+  gripper and domino models via ROS 2 services. This is the standard
+  approach for Gazebo grasping simulation (real robots use force feedback).
+-->
+<sdf version="1.4">
+
+  <world name="default">
+
+    <!-- Physics solver tuning for small-object grasping (7.5 mm domino pieces). -->
+    <physics type="ode">
+      <max_step_size>0.0005</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>2000</real_time_update_rate>
+      <ode>
+        <solver>
+          <type>quick</type>
+          <iters>150</iters>
+          <sor>1.3</sor>
+          <use_dynamic_moi_rescaling>true</use_dynamic_moi_rescaling>
+        </solver>
+        <constraints>
+          <cfm>0.0</cfm>
+          <erp>0.8</erp>
+          <contact_max_correcting_vel>1.0</contact_max_correcting_vel>
+          <contact_surface_layer>0.0</contact_surface_layer>
+        </constraints>
+      </ode>
+    </physics>
+
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <scene>
+      <shadows>0</shadows>
+    </scene>
+
+    <!-- GAZEBO PLUGINS -->
+
+    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
+      <ros>
+        <namespace>/ros2_grasp</namespace>
+        <argument>model_states:=model_states</argument>
+        <argument>link_states:=link_states</argument>
+      </ros>
+      <update_rate>1.0</update_rate>
+    </plugin>
+
+    <plugin name="gazebo_ros_properties" filename="libgazebo_ros_properties.so">
+      <ros>
+        <namespace>/ros2_grasp</namespace>
+      </ros>
+    </plugin>
+
+    <!-- LINK ATTACHER PLUGIN: creates fixed ODE joint for grasping -->
+    <plugin name="link_attacher_plugin" filename="liblink_attacher_plugin.so">
+      <ros>
+        <namespace>/</namespace>
+      </ros>
+    </plugin>
+
+  </world>
+</sdf>

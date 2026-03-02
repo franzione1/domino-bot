@@ -9,6 +9,24 @@
             <size>0.8 1.2 1.0</size>
           </box>
         </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>2.0</mu>
+              <mu2>2.0</mu2>
+            </ode>
+          </friction>
+          <contact>
+            <ode>
+              <!-- Very stiff surface — must be stiffer than fingers (1e8)
+                   so pieces cannot be pushed through the table. -->
+              <kp>1000000000.0</kp>
+              <kd>1000.0</kd>
+              <min_depth>0.0001</min_depth>
+              <max_vel>0.1</max_vel>
+            </ode>
+          </contact>
+        </surface>
       </collision>
       <visual name="visual">
         <geometry>
