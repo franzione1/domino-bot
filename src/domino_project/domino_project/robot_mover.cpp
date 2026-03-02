@@ -18,15 +18,15 @@
 
 // ─── Physical constants ───────────────────────────────────────────────────────
 // Domino piece dimensions (metres) — must match the SDF models
-// Sized to match the reference project (Robot-Domino-Artist):
-//   width=0.0075, length=0.024, height=0.048
-// In our SDF the piece lies FLAT on the table:
+// Sized for finger grasping by the Panda gripper:
+//   length=0.048, width=0.024, height=0.020  (20mm tall for reliable grip)
+// In our SDF the piece stands on the table:
 //   SDF x = 0.048 (long axis on table)
-//   SDF y = 0.024 (short axis on table)
-//   SDF z = 0.0075 (thickness, faces up when lying flat)
+//   SDF y = 0.024 (short axis on table) — gripper closes across this
+//   SDF z = 0.020  (height — tall enough for finger pads to grip)
 const double DOMINO_LEN     = 0.048;   // long axis  (SDF x)
 const double DOMINO_WID     = 0.024;   // short axis (SDF y) — gripper closes across this
-const double DOMINO_H       = 0.0075;  // thickness  (SDF z)
+const double DOMINO_H       = 0.020;   // height     (SDF z) — 20mm for finger grasping
 
 // Environment geometry — derived from the Gazebo spawn configuration.
 // work_table/model.sdf: box 0.8×1.2×1.0 m, spawned at -z 0.8 (box centre)
@@ -62,7 +62,7 @@ const double PANDA_LINK8_TO_PAD_BOTTOM = 0.0584 + 0.027 + 0.026;  // 0.1114 m (c
 //   Correct approach: derive z_presa directly from the collision geometry.
 //
 //   Goal: finger pad bottom should be TABLE_CLEARANCE mm above the table,
-//   maximising overlap with the 7.5 mm piece.
+//   maximising overlap with the 20 mm piece.
 //
 //   finger_pad_bottom = link8_z − 0.1114
 //   finger_pad_bottom = TABLE_TOP_Z + TABLE_CLEARANCE
@@ -74,7 +74,7 @@ const double PANDA_LINK8_TO_PAD_BOTTOM = 0.0584 + 0.027 + 0.026;  // 0.1114 m (c
 //   Result:
 //     link8_z = 1.30 + 0.0005 + 0.1114 = 1.4119 m
 //     finger_pad_bottom = 1.3005 m  (0.5 mm above table)
-//     piece_top = 1.3075 m  →  overlap = 7.0 mm (93% of 7.5 mm piece)  ✓
+//     piece_top = 1.320 m   →  overlap = 19.5 mm (97.5% of 20 mm piece) ✓
 //
 //   Previous value was 1.41315 (finger bottom at 1.30175, overlap=5.75mm=77%).
 //   Going 1.25 mm lower gains 17% more overlap.
@@ -389,7 +389,7 @@ private:
       target.x, target.y, drop_x, drop_y);
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 1 — OPEN FINGERS wide and leave them open for the whole mission
+    //  STEP 1 — OPEN FINGERS wide for approach
     // ═══════════════════════════════════════════════════════════════════════
     RCLCPP_INFO(this->get_logger(), "  STEP 1 — opening fingers wide...");
     muovi_pinza("open");
@@ -449,16 +449,15 @@ private:
     rclcpp::sleep_for(std::chrono::seconds(1));  // let everything settle
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 4 — GRASP: vacuum + fixed joint (Gazebo "cheat")
+    //  STEP 4 — GRASP: fingers + fixed ODE joint
     //
-    //   Real robots (like Robot-Domino-Artist) use force feedback on the
-    //   real Franka gripper.  In Gazebo we need two mechanisms:
-    //     1. Vacuum ON — applies ~1N attraction (helps but unreliable alone)
-    //     2. Link attacher — creates a fixed ODE joint (the real hold)
+    //   1. Create fixed ODE joint (link attacher) — physics hold
+    //   2. Close fingers around the piece   — visual + friction
     //
-    //   The fixed joint is the industry-standard Gazebo grasping approach.
+    //   No vacuum needed: the 20mm-tall domino gives the finger pads
+    //   ~19.5 mm of contact surface, and the fixed joint locks it in place.
     // ═══════════════════════════════════════════════════════════════════════
-    RCLCPP_INFO(this->get_logger(), "  STEP 4 — grasp (vacuum + fixed joint)...");
+    RCLCPP_INFO(this->get_logger(), "  STEP 4 — grasp (fingers + fixed joint)...");
 
     // Attach collision object to hand for MoveIt planning
     if (!target_obj.empty()) {
@@ -466,18 +465,15 @@ private:
       attached_object_id_ = target_obj;
     }
 
-    // 4a. Vacuum ON (provides some attraction force)
-    call_vacuum_service(true);
-    rclcpp::sleep_for(std::chrono::seconds(1));
-
-    // 4b. Create FIXED ODE JOINT — this is what actually holds the piece
+    // 4a. Create FIXED ODE JOINT — this is what holds the piece in physics
     call_link_attacher(true);
     rclcpp::sleep_for(std::chrono::seconds(1));
 
-    bool vacuum_ok = vacuum_attached_.load();
-    RCLCPP_INFO(this->get_logger(), "  Vacuum: %s | Fixed joint: CREATED",
-                vacuum_ok ? "ATTACHED" : "not attached (joint holds anyway)");
-    log_event("pick", true, "fixed_joint+vac=" + std::string(vacuum_ok ? "yes" : "no"));
+    // 4b. Close fingers around the piece (visual + some friction)
+    muovi_pinza("close");
+
+    RCLCPP_INFO(this->get_logger(), "  Fixed joint: CREATED | Fingers: CLOSED");
+    log_event("pick", true, "fixed_joint+fingers");
 
     // ═══════════════════════════════════════════════════════════════════════
     //  STEP 5 — LIFT straight up (Cartesian, slow)
@@ -492,8 +488,7 @@ private:
     move_group_->setMaxVelocityScalingFactor(planner_max_velocity_);
     move_group_->setMaxAccelerationScalingFactor(planner_max_acceleration_);
 
-    RCLCPP_INFO(this->get_logger(), "  Vacuum after lift: %s",
-                vacuum_attached_.load() ? "ATTACHED ✓" : "DETACHED ✗");
+    RCLCPP_INFO(this->get_logger(), "  Piece held by fixed joint — lift complete.");
 
     add_table_collision();
 
@@ -542,16 +537,16 @@ private:
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  STEP 8 — RELEASE piece (vacuum OFF)
+    //  STEP 8 — RELEASE piece (detach joint + open fingers)
     // ═══════════════════════════════════════════════════════════════════════
-    RCLCPP_INFO(this->get_logger(), "  STEP 8 — release piece (detach joint + vacuum OFF)...");
+    RCLCPP_INFO(this->get_logger(), "  STEP 8 — release piece (detach joint + open fingers)...");
     call_link_attacher(false);   // destroy fixed joint FIRST
     rclcpp::sleep_for(std::chrono::milliseconds(500));
     if (!attached_object_id_.empty()) {
       try { move_group_->detachObject(attached_object_id_); attached_object_id_ = ""; }
       catch (...) {}
     }
-    call_vacuum_service(false);
+    muovi_pinza("open");         // open fingers to release piece
     rclcpp::sleep_for(std::chrono::seconds(2));  // let piece settle on table
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -879,9 +874,13 @@ private:
       move_fingers_to(0.035);
       rclcpp::sleep_for(std::chrono::seconds(1));
       RCLCPP_INFO(this->get_logger(), "GRIPPER: fingers open.");
+    } else if (command == "close") {
+      // Close fingers around the domino (width 24mm → each joint at ~12mm)
+      RCLCPP_INFO(this->get_logger(), "GRIPPER: closing fingers around piece...");
+      move_fingers_to(0.012);  // total gap = 24mm = domino width
+      rclcpp::sleep_for(std::chrono::seconds(1));
+      RCLCPP_INFO(this->get_logger(), "GRIPPER: fingers closed.");
     }
-    // "close" is intentionally a no-op.
-    // We rely ONLY on vacuum for gripping — fingers stay open.
   }
 
   // ── Helper: send GripperCommand to one finger controller ────────────────
@@ -1031,8 +1030,7 @@ private:
     RCLCPP_ERROR(this->get_logger(), "EMERGENCY STOP – recovering.");
     try { move_group_->stop(); } catch (...) {}
     call_link_attacher(false);   // release fixed joint if any
-    call_vacuum_service(false);  // vacuum OFF
-    muovi_pinza("open");
+    muovi_pinza("open");         // open fingers
     if (!attached_object_id_.empty()) {
       try {
         move_group_->detachObject(attached_object_id_);

@@ -3,17 +3,12 @@
   <model name="domino_blue_red">
     <static>false</static>
     <link name="link">
-      <!-- Dimensions match reference project: 0.048 x 0.024 x 0.0075 m -->
+      <!-- Dimensions: 0.048 x 0.024 x 0.020 m (height sized for finger grasping) -->
       <inertial>
-        <!-- 0.02 kg: realistic domino mass (real dominos ~10-20g).
-             The ROS 2 Foxy vacuum plugin applies only 1N attraction force
-             (NO fixed joint!), so mass must be < 0.1 kg for vacuum to hold
-             against gravity.  At 0.02 kg (weight=0.196N), the 1N vacuum
-             force easily lifts and holds the piece during motion. -->
         <mass>0.02</mass>
         <inertia>
-          <ixx>1.054e-6</ixx><ixy>0</ixy><ixz>0</ixz>
-          <iyy>3.934e-6</iyy><iyz>0</iyz>
+          <ixx>1.627e-6</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>4.507e-6</iyy><iyz>0</iyz>
           <izz>4.800e-6</izz>
         </inertia>
       </inertial>
@@ -21,7 +16,7 @@
         <max_contacts>20</max_contacts>
         <geometry>
           <box>
-            <size>0.048 0.024 0.0075</size>
+            <size>0.048 0.024 0.020</size>
           </box>
         </geometry>
         <surface>
@@ -45,7 +40,7 @@
         <pose>-0.012 0 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.024 0.024 0.0075</size>
+            <size>0.024 0.024 0.020</size>
           </box>
         </geometry>
         <material>
@@ -59,7 +54,7 @@
         <pose>0.012 0 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.024 0.024 0.0075</size>
+            <size>0.024 0.024 0.020</size>
           </box>
         </geometry>
         <material>
