@@ -81,6 +81,12 @@ class SmartDominoVision(Node):
         self.bridge = CvBridge()
         self.last_print_time = 0
         self.last_detection_time = 0  # throttle detection publishing
+
+        # Create the display window on a dedicated GUI thread so it stays
+        # responsive even when the ROS callback is busy processing.
+        cv2.namedWindow("Smart Vision", cv2.WINDOW_AUTOSIZE)
+        cv2.startWindowThread()
+
         self.get_logger().info('VISION: Pronta. Logica di Gioco Domino ATTIVA.')
 
     def image_callback(self, msg):
